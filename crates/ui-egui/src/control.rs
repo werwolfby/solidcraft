@@ -56,12 +56,14 @@ pub struct ControlRequest {
     pub method: String,
     pub params: Value,
     pub reply: Sender<ControlResponse>,
+    /// Set once the window starts on it; until then it waits its turn (`control.running`, #3654).
+    pub started: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ControlRequest {
     pub fn new(method: impl Into<String>, params: Value) -> (Self, std::sync::mpsc::Receiver<ControlResponse>) {
         let (tx, rx) = std::sync::mpsc::channel();
-        (Self { method: method.into(), params, reply: tx }, rx)
+        (Self { method: method.into(), params, reply: tx, started: Default::default() }, rx)
     }
 }
 
@@ -99,7 +101,7 @@ fn key_from(name: &str) -> Option<egui::Key> {
 fn execute(app: &mut SolveApp, id: &str, params: Value) -> Result<Value, String> {
     let r = app.run(id, params);
     if r.is_ok()
-        && !matches!(id, "view.navigate" | "view.ambient_occlusion" | "view.graphics_preset")
+        && !matches!(id, "view.layout" | "view.navigate" | "view.ambient_occlusion" | "view.graphics_preset" | "view.history_layout")
         && app.session.active_sketch.is_none()
         && app.session.world_state().bodies.len() == 1
         && app.session.undo.len() <= 2
@@ -210,14 +212,16 @@ pub fn request_scope(app: &SolveApp, params: &Value) -> Result<Option<vfs::PathS
 /// mode, the section the viewport shows: an open Section Analysis dialog's preview, a sketch's
 /// Slice), with the grid and the origin's axes as `guides` says.
 pub(crate) fn view_scene(app: &SolveApp, guides: solidcraft_engine::view::Guides) -> solidcraft_engine::render::Scene {
-    solidcraft_engine::view::scene_with_palette_and_guides(
+    let mut scene = solidcraft_engine::view::scene_with_palette_and_guides(
         &app.session,
         &app.cam,
         crate::viewport::section_plane(app),
         solidcraft_engine::view::world_curve_parts,
         &crate::viewport::scene_palette(app.ui.dark, app.preferences.color_vision),
         guides,
-    )
+    );
+    scene.plain_cap = !crate::viewport::section_hatch(app);
+    scene
 }
 
 /// The grid and the origin's axes as the window shows them (the Grid and Origin switches).
@@ -384,7 +388,6 @@ fn dispatch(app: &mut SolveApp, ctx: &egui::Context, method: &str, p: &Value) ->
         }
         "ui.view" => {
             let v = s("view").unwrap_or("home");
-            app.viewport.orbit_snap = None;
             app.viewport.orbit_free = None;
             if p.get("animate").and_then(Value::as_bool).unwrap_or(false) {
                 if v != "fit" && v != "home" && StandardView::parse(v).is_none() {
@@ -885,7 +888,6 @@ fn camera(app: &mut SolveApp, p: &Value) -> Result<Value, String> {
         return serde_json::to_value(app.cam).map_err(|e| e.to_string());
     }
     app.cancel_view_animation();
-    app.viewport.orbit_snap = None;
     app.viewport.orbit_free = None;
     app.cam = cam;
     match fit {

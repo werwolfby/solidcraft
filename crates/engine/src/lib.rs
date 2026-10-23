@@ -170,9 +170,21 @@ pub struct Snapshot {
 pub struct Ahead(Session);
 
 impl Ahead {
-    /// Run `commands` (their results stay in the shared evaluation cache).
-    pub fn evaluate(self, commands: &[(String, Value)]) -> Result<()> {
-        self.0.preview_in_place(commands).map(|_| ())
+    /// What the evaluation computes, kept for the run that follows here whatever the evaluation
+    /// cache drops meanwhile: hand it to [`solidcraft_doc::Model::keep`] for that run.
+    pub fn kept(&self) -> Arc<solidcraft_doc::KeptResults> {
+        self.0.model.kept().unwrap_or_default()
+    }
+
+    /// Run `commands` (their results stay in the shared evaluation cache, and in [`Ahead::kept`]),
+    /// then make the display meshes and plans of the bodies they end with, so the window draws,
+    /// fits and picks without tessellating anything. What they evaluated comes back for
+    /// [`Session::prime`], so running them for real evaluates nothing again: the shared cache
+    /// drops results past its budget, and a large design's states are past it.
+    pub fn evaluate(self, commands: &[(String, Value)]) -> Result<Evaluated> {
+        let (after, _) = self.0.preview_in_place(commands)?;
+        after.world_state().warm_display();
+        Ok(Evaluated(after.model))
     }
 
     /// Run `commands` one after another, each reply or error in turn (what they evaluate stays
@@ -182,6 +194,10 @@ impl Ahead {
         commands.iter().map(|(id, params)| self.0.execute(id, params)).collect()
     }
 }
+
+/// The model a session copy evaluated ahead ([`Ahead::evaluate`]).
+#[derive(Clone, Debug)]
+pub struct Evaluated(solidcraft_doc::Model);
 
 /// What some commands would make, evaluated on a scratch copy of a session
 /// ([`Session::preview`]). The session itself is not changed.
@@ -257,12 +273,17 @@ pub struct Session {
     /// Recent body renames: the design before and after each, and the names, so undo and redo
     /// follow them without evaluating either.
     body_renames: Vec<BodyRename>,
+    /// Bodies' contact meshes (shared with scratch copies): a joint driven again meshes no body
+    /// that did not change.
+    contact_meshes: std::sync::Arc<std::sync::Mutex<cmd::motion::contact_sweep::ContactMeshes>>,
     /// Features copied with `timeline.copy` (pasted by `timeline.paste`).
     pub clipboard: Vec<solidcraft_doc::Feature>,
     /// Sketch geometry copied with `sketch.copy` (pasted by `sketch.paste`).
     pub sketch_clipboard: Option<cmd::sketch_clipboard::SketchClip>,
     /// Section Analysis: a view cut by a plane (origin, unit normal; the normal side is hidden).
     pub section: Option<(Vec3, Vec3)>,
+    /// Whether the section's cut faces are hatched (`inspect.section`'s `hatch`; on by default).
+    pub section_hatch: bool,
     /// Surface analysis shading the model (zebra, draft, curvature map).
     pub analysis: Option<SurfaceAnalysis>,
     /// The seams `inspect.continuity` last measured, for the viewport to shade. View state: not
@@ -290,6 +311,8 @@ pub struct Session {
     /// Full model evaluations (`refresh`), for tests.
     #[cfg(test)]
     pub(crate) evaluations: usize,
+    /// Resolved associative trace inputs, independent of the document revision and view state.
+    pub(crate) motion_traces: cmd::motion::associative::Cache,
 }
 
 /// A sketch changed by one frame of an interactive gesture (`live: true`).
@@ -411,9 +434,11 @@ impl Session {
             removed_later_cache: Default::default(),
             clearance_cache: Default::default(),
             body_renames: Vec::new(),
+            contact_meshes: Default::default(),
             clipboard: Vec::new(),
             sketch_clipboard: None,
             section: None,
+            section_hatch: true,
             analysis: None,
             continuity: Vec::new(),
             checkpoints: Vec::new(),
@@ -425,22 +450,31 @@ impl Session {
             render_jobs: Default::default(),
             #[cfg(test)]
             evaluations: 0,
+            motion_traces: Default::default(),
             crash_journal: false,
         }
     }
 
     /// Become `fresh` (another design opened, recovered or started), keeping the settings that
     /// are the user's rather than the design's: `auto_project` is a preference (#680).
+    /// Checkpoints survive too: a batch that failed after `file.new` or `doc.open` goes back
+    /// from the checkpoint it took before its first step, and that checkpoint belongs to the
+    /// design before the batch, which is what the batch promised (#3242). The design is what a
+    /// checkpoint keeps, not the replaced session's file path (docs/mcp.md).
     pub fn replace_design(&mut self, fresh: Session) {
         let auto_project = self.auto_project;
         let param_check = self.param_check;
         let render_viewport = self.render_viewport.clone();
         let render_jobs = self.render_jobs.scratch();
+        let checkpoints = std::mem::take(&mut self.checkpoints);
+        let next_checkpoint = self.next_checkpoint;
         *self = fresh;
         self.auto_project = auto_project;
         self.param_check = param_check;
         self.render_viewport = render_viewport;
         self.render_jobs = render_jobs;
+        self.checkpoints = checkpoints;
+        self.next_checkpoint = next_checkpoint;
     }
 
     /// The design has changes not in its file: in the document, or in what is hidden.
@@ -623,8 +657,9 @@ impl Session {
         self.prune_occurrence_state();
         // Joints follow the geometry their origins snap to.
         if !self.doc.assembly.joints.is_empty() {
-            cmd::joints::resolve(self);
+            cmd::joints::place(self);
         }
+        cmd::motion::associative::refresh(self);
         if let Some(id) = self.active_sketch
             && self.doc.feature(id).is_none()
         {
@@ -641,7 +676,7 @@ impl Session {
         {
             self.revision += 1;
             if !self.doc.assembly.joints.is_empty() {
-                cmd::joints::resolve(self);
+                cmd::joints::place(self);
             }
             return;
         }
@@ -729,6 +764,28 @@ impl Session {
     /// as before. Otherwise store each sketch whose values changed as solved, so the next edit
     /// continues from it (see `Model::adopt_solved_sketches`).
     pub(crate) fn settle_value_edit(&mut self, solved_before: &SketchValues) -> Result<()> {
+        // Quantity changes alter topology, so store the regenerated instances in the same
+        // transaction as the parameter edit. Later picks and undo must see those same ids.
+        let mut updated: Vec<_> = self
+            .doc
+            .features
+            .iter()
+            .filter_map(|feature| match &feature.kind {
+                solidcraft_doc::FeatureKind::Sketch { sketch, .. } if sketch.patterns.iter().any(|p| p.count_expression.is_some()) => {
+                    Some((feature.id, sketch.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        if !updated.is_empty() {
+            let (vals, _) = self.doc.param_values();
+            for (_, sketch) in &mut updated {
+                self.doc.apply_pattern_quantities(&vals, sketch)?;
+            }
+        }
+        for (id, sketch) in updated {
+            *self.doc_mut().sketch_mut(id)? = sketch;
+        }
         self.refresh();
         for r in &self.model.results {
             let (Some(before), Some(k)) = (solved_before.get(&r.id), r.state.sketch(r.id)) else { continue };
@@ -935,9 +992,11 @@ impl Session {
             removed_later_cache: Default::default(),
             clearance_cache: self.clearance_cache.clone(),
             body_renames: Vec::new(),
+            contact_meshes: self.contact_meshes.clone(),
             clipboard: self.clipboard.clone(),
             sketch_clipboard: self.sketch_clipboard.clone(),
             section: None,
+            section_hatch: true,
             analysis: None,
             continuity: Vec::new(),
             checkpoints: Vec::new(),
@@ -949,6 +1008,7 @@ impl Session {
             saved_visibility: self.saved_visibility.clone(),
             #[cfg(test)]
             evaluations: 0,
+            motion_traces: self.motion_traces.clone(),
             crash_journal: false,
         }
     }
@@ -958,6 +1018,19 @@ impl Session {
     pub fn invalidate_view(&mut self, previous_revision: u64) {
         let old = self.revision;
         self.revision = old.max(previous_revision) + 1;
+    }
+
+    /// Offer what a copy of this session evaluated ahead for the commands about to run
+    /// ([`Ahead::evaluate`]): until [`Session::unprime`], evaluating takes each feature result
+    /// whose inputs match instead of computing it again (a design changed meanwhile matches
+    /// less, or nothing, and is evaluated as usual).
+    pub fn prime(&mut self, evaluated: &Evaluated) {
+        self.model.prime(&evaluated.0);
+    }
+
+    /// Stop offering what [`Session::prime`] offered.
+    pub fn unprime(&mut self) {
+        self.model.unprime();
     }
 
     /// Commit commands evaluated on a scratch copy without losing this session's file,
@@ -1022,6 +1095,7 @@ impl Session {
         let mut copy = self.scratch();
         copy.undo.clone_from(&self.undo);
         copy.redo.clone_from(&self.redo);
+        copy.model.keep(Some(Arc::default()));
         Ahead(copy)
     }
 
@@ -1166,5 +1240,14 @@ pub(crate) type SketchValues = std::collections::BTreeMap<u64, std::collections:
 /// The values of a sketch's driving dimensions that come from parameters: what a value edit
 /// changes in it (as opposed to geometry it projects or links from upstream).
 fn own_values(sk: &solidcraft_sketch::Sketch) -> std::collections::BTreeMap<String, f64> {
-    sk.constraints.iter().filter(|c| c.param.is_some() && !c.driven).filter_map(|c| Some((c.id.clone(), c.kind.value()?))).collect()
+    let mut values: std::collections::BTreeMap<_, _> =
+        sk.constraints.iter().filter(|c| c.param.is_some() && !c.driven).filter_map(|c| Some((c.id.clone(), c.kind.value()?))).collect();
+    for pattern in &sk.patterns {
+        if pattern.count_expression.is_some()
+            && let solidcraft_sketch::SketchPatternKind::Circular { count, .. } = pattern.kind
+        {
+            values.insert(format!("pattern:{}:count", pattern.id), count as f64);
+        }
+    }
+    values
 }

@@ -49,7 +49,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .noundo()
         .doc_only()
         .contract(&DESCRIBE_CONTRACT)
-        .output(crate::schema::output_schema_for::<crate::schema::DescribeResult>)
+        .output(crate::schema::output_schema_for::<crate::schema::inspect::DescribeResult>)
         .params("command: a command id. Returns {id, label, params, input, output} (and param_warnings in the warn parameter-check mode): the command's parameter documentation and, once the command has a typed contract, the JSON Schemas (2020-12) of its parameters and of a successful result (null otherwise). Read-only."),
 ];
 
@@ -86,10 +86,11 @@ fn measure(s: &mut Session, p: &Value) -> Result<Value> {
         .collect();
     // Mass from each body's material.
     for (b, body) in bodies.iter_mut().zip(selected) {
+        let source = body.definition_name();
+        // Every body's material, measured or not: naming it takes no measuring.
+        b["material"] = json!(s.doc.body_material(source));
         if let Some(v) = b["volume_mm3"].as_f64() {
-            let source = body.definition_name();
             let rho = s.doc.density(source);
-            b["material"] = json!(s.doc.materials.get(source).cloned().unwrap_or_else(|| "Default".into()));
             b["density_g_cm3"] = json!(rho);
             b["mass_g"] = json!(v * rho / 1000.0);
         }
@@ -326,13 +327,13 @@ fn model_faces(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"body": b.name, "faces": faces}))
 }
 
-const DESCRIBE_CONTRACT: crate::schema::TypedContract<crate::schema::DescribeParams> = crate::schema::TypedContract::new();
+const DESCRIBE_CONTRACT: crate::schema::TypedContract<crate::schema::inspect::DescribeParams> = crate::schema::TypedContract::new();
 
 /// A command's prose documentation and, for converted commands, its schemas.
 fn describe(_s: &mut Session, p: &Value) -> Result<Value> {
     let id = p.get("command").and_then(Value::as_str).ok_or_else(|| crate::params::bad("engine.describe", "`command` must be a command id"))?;
     let spec = super::find_command(id).ok_or_else(|| crate::EngineError::UnknownCommand(id.to_string()))?;
-    let reply = crate::schema::DescribeResult {
+    let reply = crate::schema::inspect::DescribeResult {
         id: spec.id.to_string(),
         label: spec.label.to_string(),
         params: spec.params.to_string(),
@@ -362,7 +363,7 @@ fn physical_material(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(cmd, "`bodies` must list existing bodies"));
     }
     for b in &bodies {
-        if canonical == "Default" {
+        if canonical == solidcraft_doc::DEFAULT_MATERIAL {
             s.doc_mut().materials.remove(b);
         } else {
             s.doc_mut().materials.insert(b.clone(), canonical.clone());

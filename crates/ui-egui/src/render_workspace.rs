@@ -1,5 +1,6 @@
 //! Integrated product preview. Shares the installed device/pipelines, not Design's scene policy.
 
+use crate::ui_kit::{Container, Edge, Surface};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
@@ -173,10 +174,11 @@ pub fn panel(app: &mut SolveApp, ui: &mut egui::Ui) {
         app.render_workspace.view.draft = app.session.doc.render.setups.get(&app.render_workspace.view.name).cloned().unwrap_or_default();
         app.render_workspace.revision = app.session.revision;
     }
-    egui::Panel::right("sc_render_settings")
+    Container::new(ui.ctx(), Surface::Panel)
+        .edge("sc_render_settings", Edge::Right)
         .exact_size(285.0)
         .resizable(false)
-        .frame(egui::Frame::NONE.fill(Tokens::get().panel).inner_margin(10))
+        .frame(Container::new(ui.ctx(), Surface::Panel).edge_frame(Tokens::get().panel).inner_margin(10))
         .show(ui, |ui| {
             crate::ui_kit::scope(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
@@ -551,6 +553,8 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
             ao_radius: 0.0,
             eye: [eye.x as f32, eye.y as f32, eye.z as f32, if camera.fov > 0.0 { 1.0 } else { 0.0 }],
             ssaa: if width < full.0 { width as f32 / full.0 as f32 } else { 1.0 },
+            hover_tint: [0.0; 3],
+            selection_tint: [0.0; 3],
         });
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(rect, callback));
         Ok(())

@@ -438,6 +438,75 @@ fn new_creation_tools() {
     assert!(a.iter().any(|x| close(*x, pi * 5.0 * 2.0 + pi)), "{a:?}");
 }
 
+/// #3141: a 2-tangent circle asked for near a point on one of its curves (where a click on that
+/// curve puts it) is solved from the touching circle nearest that point: it lands in the corner,
+/// the rectangle stays as drawn, and fixed sides no longer make it fail.
+#[test]
+fn two_tangent_circle_from_a_click_on_a_curve_leaves_the_curves_as_drawn() {
+    let side = |s: &Session, sides: &[String], on: fn(Vec2) -> bool| -> String {
+        let sk = sketch(s);
+        sides
+            .iter()
+            .find(|c| {
+                let i = sk.curve_index(c).unwrap();
+                matches!(sk.shape(i), Some(solidcraft_sketch::Shape::Line { a, b }) if on(a) && on(b))
+            })
+            .unwrap()
+            .clone()
+    };
+    let points = |s: &Session| sketch(s).points.iter().map(|p| p.pos).collect::<Vec<_>>();
+    for fixed in [false, true] {
+        let mut s = new_sketch();
+        let r = run(&mut s, "sketch.rectangle.two_point", json!({"p0": [-800, 0], "p1": [-300, 500]}));
+        let sides = ids(&r["curves"]);
+        if fixed {
+            run(&mut s, "sketch.constraint.fix", json!({"entities": sides}));
+        }
+        let before = points(&s);
+        let bottom = side(&s, &sides, |p| p.y.abs() < 1e-9);
+        let left = side(&s, &sides, |p| (p.x + 800.0).abs() < 1e-9);
+        // Midway between a click on the bottom side and one on the left side.
+        let r = run(&mut s, "sketch.circle.two_tangent", json!({"curves": [bottom, left], "radius": 50, "near": [-675, 125]}));
+        let c = ids(&r["curves"])[0].clone();
+        let sk = sketch(&s);
+        let ci = sk.curve_index(&c).unwrap();
+        assert!(sk.center(ci).unwrap().dist(Vec2::new(-750.0, 50.0)) < 1e-6, "fixed {fixed}: {:?}", sk.center(ci));
+        assert!(close(sk.radius(ci).unwrap(), 50.0));
+        let after = points(&s);
+        assert!(before.iter().zip(&after).all(|(a, b)| a.dist(*b) < 1e-9), "fixed {fixed}: the rectangle did not move: {after:?}");
+        // Asked for right on the left side: still a touching circle next to it.
+        let r = run(&mut s, "sketch.circle.two_tangent", json!({"curves": [bottom, left], "radius": 20, "near": [-800, 30]}));
+        let c = ids(&r["curves"])[0].clone();
+        let sk = sketch(&s);
+        let o = sk.center(sk.curve_index(&c).unwrap()).unwrap();
+        assert!(close(o.y, 20.0) && close((o.x + 800.0).abs(), 20.0), "fixed {fixed}: {o:?}");
+    }
+}
+
+/// #3099: a centre circle drawn through a point stays on it. Centred on a line's midpoint and
+/// through its end, the circle's radius follows the line when the line is dimensioned.
+#[test]
+fn centre_circle_through_a_point_keeps_it_on_the_circle() {
+    let mut s = new_sketch();
+    let l = ids(&run(&mut s, "sketch.line", json!({"points": [[0, 30], [40, 30]]}))["curves"])[0].clone();
+    let r = run(&mut s, "sketch.circle.center", json!({"center": format!("mid:{l}"), "radius": 20, "through": format!("{l}.end")}));
+    let c = ids(&r["curves"])[0].clone();
+    let sk = sketch(&s);
+    let (li, ci) = (sk.curve_index(&l).unwrap(), sk.curve_index(&c).unwrap());
+    let end = sk.resolve_point(&format!("{l}.end")).unwrap();
+    assert!(sk.constraints.iter().any(|k| k.kind == ConstraintKind::PointOnCurve { p: end, c: ci }), "{:?}", sk.constraints);
+    run(&mut s, "sketch.dimension", json!({"entities": [l], "value": 60}));
+    let sk = sketch(&s);
+    let line = sk.shape(li).unwrap();
+    let solidcraft_sketch::Shape::Line { a, b } = line else { panic!("{line:?}") };
+    assert!(close(a.dist(b), 60.0));
+    assert!(close(sk.radius(ci).unwrap(), 30.0), "the circle followed the line's end: {:?}", sk.radius(ci));
+    // Through a plain position: nothing to keep it on.
+    let r = run(&mut s, "sketch.circle.center", json!({"center": [100, 0], "radius": 5, "through": [105, 0]}));
+    let ci = sketch(&s).curve_index(&ids(&r["curves"])[0]).unwrap();
+    assert!(!sketch(&s).constraints.iter().any(|k| matches!(k.kind, ConstraintKind::PointOnCurve { c, .. } if c == ci)));
+}
+
 #[test]
 fn ellipse_splines_conic() {
     let pi = std::f64::consts::PI;
@@ -1744,4 +1813,240 @@ fn trim_piece_is_what_a_trim_there_takes_away() {
     let lone = ids(&run(&mut s, "sketch.line", json!({"points": [[0,0], [8,0]], "connect": false}))["curves"])[0].clone();
     let piece = super::trim_piece(&sketch(&s), &lone, Vec2::new(3.0, 0.0)).unwrap();
     assert!(near(piece[0], [0.0, 0.0]) && near(piece[piece.len() - 1], [8.0, 0.0]), "{piece:?}");
+}
+
+/// An offset's ends follow its source curves, so trimming a piece off it or extending it is
+/// refused (the trim used to report success and leave the curve whole). Trimming away a whole
+/// offset curve still works, and once the association is broken the trim cuts it.
+#[test]
+fn trim_and_extend_refuse_an_offsets_ends_until_its_association_is_broken() {
+    let mut s = new_sketch();
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [40, 30]}));
+    let out = ids(&run(&mut s, "sketch.offset", json!({"curves": ["l1", "l2", "l3", "l4"], "distance": "2 mm", "side": [-5, -5]}))["curves"]);
+    assert_eq!(out, ["l5", "l6", "l7", "l8"]);
+    run(&mut s, "sketch.line", json!({"points": [[20, -10], [20, 10]]}));
+    let before = serde_json::to_value(sketch(&s)).unwrap();
+    let e = s.execute("sketch.trim", &json!({"curve": "l5", "at": [30, -2]})).unwrap_err().to_string();
+    assert!(e.contains("offset") && e.contains("break the offset association"), "{e}");
+    let e = s.execute("sketch.extend", &json!({"curve": "l5", "at": [42, -2]})).unwrap_err().to_string();
+    assert!(e.contains("offset"), "{e}");
+    assert_eq!(serde_json::to_value(sketch(&s)).unwrap(), before, "a refused trim changes nothing");
+
+    run(&mut s, "sketch.offset.break", json!({"curve": "l5"}));
+    run(&mut s, "sketch.trim", json!({"curve": "l5", "at": [30, -2]}));
+    let sk = sketch(&s);
+    let sh = sk.shape(sk.curve_index("l5").unwrap()).unwrap();
+    assert!(
+        matches!(sh, solidcraft_sketch::Shape::Line { a, b } if a.dist(Vec2::new(-2.0, -2.0)) < 1e-9 && b.dist(Vec2::new(20.0, -2.0)) < 1e-9),
+        "{sh:?}"
+    );
+}
+
+/// #2874: an offset's corners follow its source curves, so filleting them is refused before
+/// anything changes (the whole batch), instead of leaving full circles and an unsolved sketch.
+/// Once the offset association is broken the same corners round normally.
+#[test]
+fn fillet_refuses_an_offsets_corners_until_its_association_is_broken() {
+    let mut s = new_sketch();
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [40, 30]}));
+    let out = ids(&run(&mut s, "sketch.offset", json!({"curves": ["l1", "l2", "l3", "l4"], "distance": "2 mm", "side": [-5, -5]}))["curves"]);
+    assert_eq!(out, ["l5", "l6", "l7", "l8"]);
+    let before = serde_json::to_value(sketch(&s)).unwrap();
+    let corners = json!({"points": ["l5.start", "l5.end", "l6.end", "l7.end"], "radius": "2 mm"});
+    let e = s.execute("sketch.fillet", &corners).unwrap_err().to_string();
+    assert!(e.contains("offset") && e.contains("break the offset association"), "{e}");
+    assert_eq!(serde_json::to_value(sketch(&s)).unwrap(), before, "a refused fillet changes nothing");
+    let e = s.execute("sketch.chamfer.equal_distance", &json!({"point": "l6.end", "distance": 1})).unwrap_err().to_string();
+    assert!(e.contains("offset"), "{e}");
+
+    run(&mut s, "sketch.offset.break", json!({"curve": "l5"}));
+    let f = run(&mut s, "sketch.fillet", corners);
+    assert_eq!(f["sketch"]["solved"], json!(true), "{f}");
+    let sk = sketch(&s);
+    let arcs = ids(&f["curves"]);
+    assert_eq!(arcs.len(), 4);
+    for arc in &arcs {
+        let ai = sk.curve_index(arc).unwrap();
+        assert!(matches!(sk.curves[ai].kind, CurveKind::Arc { .. }), "{arc} is a trimmed arc");
+        assert!((sk.radius(ai).unwrap() - 2.0).abs() < 1e-7);
+    }
+}
+
+/// #4681: a fillet radius typed as `=name` (a leading equals sign, as in a spreadsheet) is the
+/// expression after the sign, so it can follow a parameter.
+#[test]
+fn fillet_radius_accepts_a_leading_equals_sign() {
+    let mut s = new_sketch();
+    run(&mut s, "sketch.line", json!({"points": [[0, 0], [50, 0], [50, 30], [0, 30]], "closed": true, "ids": ["a", "b", "c", "d"]}));
+    let first = run(&mut s, "sketch.fillet", json!({"point": "a.end", "radius": 4}));
+    let pname = first["param"].as_str().unwrap().to_string();
+    let second = run(&mut s, "sketch.fillet", json!({"point": "b.end", "radius": format!("={pname}")}));
+    let sk = sketch(&s);
+    let arc = ids(&second["curves"])[0].clone();
+    let ai = sk.curve_index(&arc).unwrap();
+    assert!((sk.radius(ai).unwrap() - 4.0).abs() < 1e-7);
+    // Changing the parameter moves both fillets.
+    run(&mut s, "parameters.change", json!({"name": pname, "expression": "6 mm"}));
+    let sk = sketch(&s);
+    let ai = sk.curve_index(&arc).unwrap();
+    assert!((sk.radius(ai).unwrap() - 6.0).abs() < 1e-7);
+    let plain = run(&mut s, "sketch.fillet", json!({"point": "c.end", "radius": "= 2 mm"}));
+    assert!(plain["curves"].is_array());
+}
+
+/// A point midway between an offset output and its source, inside the wall they bound.
+fn inside_offset_wall(s: &Session, output: &str) -> Vec2 {
+    let sk = sketch(s);
+    let index = sk.curve_index(output).unwrap();
+    let q = sk.exact_pieces(index)[0].point_at(0.5);
+    let source: Vec<_> = (0..sk.curves.len()).filter(|i| *i < index && !sk.freeform_offsets.iter().any(|o| o.output == sk.curves[*i].id)).collect();
+    let p = source
+        .iter()
+        .flat_map(|i| sk.exact_pieces(*i))
+        .flat_map(|seg| (0..=2000).map(move |k| seg.point_at(k as f64 / 2000.0)))
+        .min_by(|a, b| a.dist(q).total_cmp(&b.dist(q)))
+        .unwrap();
+    p.lerp(q, 0.5)
+}
+
+#[test]
+fn freeform_offsets_trim_folds_and_round_chain_corners_into_an_extrudable_wall() {
+    // A cookie-cutter outline whose notch near (4.2, 36) bends with a radius of about
+    // 0.3 mm: 1.26 mm outwards its plain offset folds over itself there. The offset is
+    // trimmed to the parallel boundary (open splines meeting at a corner), unlinked.
+    let cookie = json!([
+        [0, 0],
+        [-1.6, 12.8],
+        [-7.4, 23.4],
+        [-4.8, 26.6],
+        [-8.6, 39],
+        [2.8, 41.6],
+        [4.2, 36],
+        [11.8, 43.2],
+        [17.2, 43.2],
+        [37.2, 24.6],
+        [38.6, 23],
+        [35.8, 16.4],
+        [35.8, 0],
+        [24.2, 0],
+        [9.6, 0]
+    ]);
+    let mut s = new_sketch();
+    run(&mut s, "sketch.spline.fit_point", json!({"points": cookie, "periodic": true}));
+    let (before, params) = (s.doc.to_json(), s.doc.params.len());
+    let out = run(&mut s, "sketch.offset", json!({"curves": ["s1"], "distance": 1.26}));
+    let curves = ids(&out["curves"]);
+    assert!(!curves.is_empty(), "{out}");
+    assert_eq!(out["param"], Value::Null, "a trimmed offset has no distance to drive: {out}");
+    assert_eq!(out["sketch"]["dof"], 30, "the offset adds no freedom (only the source's fit points move): {out}");
+    assert_eq!(s.doc.params.len(), params, "no orphan distance parameter");
+    let sk = sketch(&s);
+    assert!(sk.freeform_offsets.is_empty() && !sk.constraints.iter().any(|c| matches!(c.kind, ConstraintKind::OffsetDistance { .. })));
+    // The source and its offset bound the inner region and the wall around it.
+    let areas = profiles(&s);
+    assert_eq!(areas.len(), 2, "{areas:?}");
+    let wall = inside_offset_wall(&s, &curves[0]);
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(s.doc.to_json(), before);
+    run(&mut s, "edit.redo", json!({}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": 10, "profiles": [{"point": [wall.x, wall.y]}]}));
+    let volume = body_volumes(&mut s);
+    assert_eq!(volume.len(), 1);
+    assert!((volume[0] - 10.0 * areas[0]).abs() < 0.01 * volume[0], "{volume:?} for a wall of {} mm²", areas[0]);
+
+    // An outline the way drawing programs save it: cubic Bézier curves with two corners,
+    // a joint kinked by a few thousandths of a degree, and a zero-length handle. Each
+    // side is the parallel boundary, rounded at outer corners and trimmed at inner ones.
+    let svg = r#"<svg width="60mm" height="60mm" viewBox="-15 -15 60 60"><path d="M0,0 C10,-5 20,-5 30,0 C35,10 35,20 30,30 C25.0002,40 10,40 5,35 C4,31 8,20 8,20 C0,15 -5,5 0,0 Z"/></svg>"#;
+    for distance in [1.26, -1.26] {
+        let mut s = new_sketch();
+        run(&mut s, "sketch.insert_svg", json!({"text": svg}));
+        let sources = sketch(&s).curves.iter().map(|c| c.id.clone()).collect::<Vec<_>>();
+        assert_eq!(sources.len(), 5);
+        // Picking every curve of the chain makes one offset, not one per curve.
+        let out = run(&mut s, "sketch.offset", json!({"curves": sources, "distance": distance}));
+        let curves = ids(&out["curves"]);
+        let sk = sketch(&s);
+        assert!(
+            curves.iter().any(|c| matches!(sk.curves[sk.curve_index(c).unwrap()].kind, CurveKind::Arc { .. })),
+            "an outer corner is rounded: {out}"
+        );
+        assert_eq!(sk.curves.len(), 5 + curves.len());
+        let source: Vec<_> = (0..5).flat_map(|i| sk.exact_pieces(i)).collect();
+        for c in &curves {
+            for seg in sk.exact_pieces(sk.curve_index(c).unwrap()) {
+                for k in 0..=8 {
+                    let p = seg.point_at(k as f64 / 8.0);
+                    let d = source.iter().flat_map(|s| (0..=2000).map(move |j| s.point_at(j as f64 / 2000.0).dist(p))).fold(f64::INFINITY, f64::min);
+                    assert!((d - 1.26).abs() < solidcraft_sketch::OFFSET_TOLERANCE, "distance {d} at {p:?}");
+                }
+            }
+        }
+        let areas = profiles(&s);
+        assert_eq!(areas.len(), 2, "{areas:?}");
+        let wall = inside_offset_wall(&s, &curves[0]);
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "solid.extrude", json!({"distance": 10, "profiles": [{"point": [wall.x, wall.y]}]}));
+        let volume = body_volumes(&mut s);
+        let ring = areas.iter().copied().fold(f64::INFINITY, f64::min).min((areas[1] - areas[0]).abs());
+        assert_eq!(volume.len(), 1);
+        assert!(volume[0] > 0.0 && (volume[0] - 10.0 * ring).abs() < 0.02 * volume[0], "{volume:?} against {areas:?}");
+    }
+}
+
+#[test]
+fn freeform_chain_offsets_take_the_straight_pieces_of_the_chain_along() {
+    // Outlines mix straight pieces with free-form ones: an SVG path with `L` commands, a
+    // text glyph (lines and conics). Picking one curve offsets the whole chain, lines too.
+    let distance = 1.26;
+    let certified = |s: &Session, curves: &[String]| {
+        let sk = sketch(s);
+        let offsets: Vec<usize> = curves.iter().map(|c| sk.curve_index(c).unwrap()).collect();
+        let source: Vec<_> = (0..sk.curves.len()).filter(|i| !offsets.contains(i)).flat_map(|i| sk.exact_pieces(i)).collect();
+        for &c in &offsets {
+            for seg in sk.exact_pieces(c) {
+                for k in 0..=8 {
+                    let p = seg.point_at(k as f64 / 8.0);
+                    let d = source.iter().flat_map(|s| (0..=2000).map(move |j| s.point_at(j as f64 / 2000.0).dist(p))).fold(f64::INFINITY, f64::min);
+                    assert!((d - distance).abs() < solidcraft_sketch::OFFSET_TOLERANCE, "distance {d} at {p:?}");
+                }
+            }
+        }
+    };
+
+    let svg = r#"<svg width="60mm" height="60mm" viewBox="-15 -15 60 60"><path d="M0,0 L30,0 C35,10 35,20 30,30 L0,30 Z"/></svg>"#;
+    for d in [distance, -distance] {
+        let mut s = new_sketch();
+        run(&mut s, "sketch.insert_svg", json!({"text": svg}));
+        let sk = sketch(&s);
+        let kinds = sk.curves.iter().map(|c| matches!(c.kind, CurveKind::Line { .. })).collect::<Vec<_>>();
+        assert_eq!(kinds, [true, false, true, true], "lines and one Bézier curve");
+        let line = sk.curves[0].id.clone();
+        let out = run(&mut s, "sketch.offset", json!({"curves": [line], "distance": d}));
+        let curves = ids(&out["curves"]);
+        assert!(!curves.is_empty(), "{out}");
+        assert_eq!(sketch(&s).curves.len(), 4 + curves.len());
+        certified(&s, &curves);
+        let areas = profiles(&s);
+        assert_eq!(areas.len(), 2, "{areas:?}");
+        let wall = inside_offset_wall(&s, &curves[0]);
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "solid.extrude", json!({"distance": 10, "profiles": [{"point": [wall.x, wall.y]}]}));
+        assert_eq!(body_volumes(&mut s).len(), 1);
+    }
+
+    // The letter D: a straight stem and conic bowls, outside and inside.
+    let mut s = new_sketch();
+    run(&mut s, "sketch.text", json!({"text": "D", "at": [0, 0], "height": 30}));
+    let sk = sketch(&s);
+    assert!(
+        sk.curves.iter().any(|c| matches!(c.kind, CurveKind::Line { .. }))
+            && sk.curves.iter().any(|c| sk.shape(sk.curve_index(&c.id).unwrap()).is_none())
+    );
+    let line = sk.curves.iter().find(|c| matches!(c.kind, CurveKind::Line { .. })).unwrap().id.clone();
+    let out = run(&mut s, "sketch.offset", json!({"curves": [line], "distance": distance}));
+    let curves = ids(&out["curves"]);
+    assert!(!curves.is_empty(), "{out}");
+    certified(&s, &curves);
 }
