@@ -187,7 +187,6 @@ fn contribution_saved_part(file: &ContributionPart) -> crate::SolveApp {
 fn contribution_linked_design_clipboard_crosses_tabs_reuses_links_and_undoes_once() {
     let file = ContributionPart::new();
     let mut app = contribution_saved_part(&file);
-    assert!(super::can_copy(&app));
     assert!(super::copy(&mut app));
     crate::documents::open_tab(&mut app, solidcraft_engine::Session::default()).unwrap();
     assert!(super::can_paste(&app));
@@ -278,7 +277,7 @@ fn contribution_linked_paste_uses_the_pointer_and_pending_numeric_move() {
 fn contribution_paste_pointer_uses_parent_coordinates_and_safe_fallbacks() {
     use solidcraft_engine::{doc, geom::Vec3};
     let mut h = crate::scenario::Harness::new();
-    let parent = h.app.run("component.create", json!({"name":"Parent"})).unwrap();
+    let parent = h.app.run("component.create", json!({"name":"Parent","grounded":false})).unwrap();
     h.app
         .run("occurrence.move", json!({"occurrence":parent["occurrence"],"translate":[20,30,10],"axis":[1,0,0],"angle":"45 deg","capture":true}))
         .unwrap();

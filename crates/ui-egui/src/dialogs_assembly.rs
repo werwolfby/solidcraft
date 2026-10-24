@@ -386,12 +386,17 @@ pub struct SnapPt {
     pub param: Value,
 }
 
-/// The occurrence placing a body (0: the root design), when the body is its primary instance.
+/// The occurrence placing a world body (0: the root design), the instance its name says.
 pub(crate) fn occurrence_of_body(s: &Session, body: &str) -> Option<u64> {
+    // The world name tells the instance: a further occurrence of a component is not its first.
     let st = s.world_state();
     let b = st.body(body)?;
-    let comp = s.doc.model_body_component(b);
-    if comp == 0 { Some(0) } else { s.doc.occurrence_of(comp).map(|o| o.id) }
+    if s.doc.model_body_component(b) == 0 {
+        return Some(0);
+    }
+    let model = s.model.state();
+    let (_, _, _, path, _) = s.doc.body_frames_with_source(&model).into_iter().find(|(world, ..)| world == body)?;
+    path.last().copied()
 }
 
 /// Centre and unit normal of the circle through a polyline's points, if it lies on one.
@@ -1007,16 +1012,12 @@ pub fn animate(app: &SolveApp, k: &Asm, cmds: &mut Vec<(String, Value)>) {
                 None
             }
             // As-built joints start at zero: drive the new one after it is made.
-            None => Some(next_joint_id(&app.session)),
+            None => app.session.doc.next_item_id().ok(),
         },
     };
     if let Some(id) = drive {
         cmds.push(("joint.drive".into(), json!({"joint": id, "values": values})));
     }
-}
-
-fn next_joint_id(s: &Session) -> u64 {
-    s.doc.assembly.joints.iter().map(|j| j.id).max().unwrap_or(0) + 1
 }
 
 /// Joint and drive previews: the commands run on a scratch copy and the placed model before and
@@ -1163,7 +1164,7 @@ fn glyph(painter: &egui::Painter, proj: &Proj, s: &SnapPt, col: Color32, half_he
 }
 
 /// What a snap is called (the hover label).
-fn snap_name(k: SnapKind) -> &'static str {
+pub(crate) fn snap_name(k: SnapKind) -> &'static str {
     match k {
         SnapKind::FaceCenter => "Face center",
         SnapKind::CircleCenter => "Circle center",
@@ -1224,8 +1225,8 @@ pub fn timeline_joints(app: &mut SolveApp, ui: &mut egui::Ui, p: &egui::Painter,
         } else {
             t.timeline_item
         };
-        p.rect(br, 3.0, bg, Stroke::new(1.0, t.border), egui::StrokeKind::Inside);
-        crate::icons::paint(p, br.shrink(4.0), "joint", if suppressed { t.border } else { t.icon }, t.icon_fill, t.accent);
+        p.rect(br, t.radius_sm.saturating_sub(1), bg, t.control_border_stroke(t.border), egui::StrokeKind::Inside);
+        crate::icons::paint_icon(p, br.shrink(4.0), "joint", f32::from((if suppressed { t.border } else { t.icon }).a()) / 255.0);
         if suppressed {
             p.line_segment([br.left_bottom() + vec2(4.0, -4.0), br.right_top() + vec2(-4.0, 4.0)], Stroke::new(1.5, t.text_dim));
         }
@@ -1238,7 +1239,7 @@ pub fn timeline_joints(app: &mut SolveApp, ui: &mut egui::Ui, p: &egui::Painter,
         if resp.secondary_clicked() && !app.tree.picked_joints.contains(&id) {
             pick_joint(app, id, false);
         }
-        resp.context_menu(|ui| joint_menu(app, ui, (id, kind, suppressed), &mut open, &mut run));
+        crate::ui_kit::Menu::context(&resp, |ui| joint_menu(app, ui, (id, kind, suppressed), &mut open, &mut run));
         x += 32.0;
     }
     if let Some((c, prm)) = run {
@@ -1271,12 +1272,12 @@ pub fn timeline_joints_vertical(app: &mut SolveApp, ui: &mut egui::Ui) {
         let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), egui::Sense::click());
         crate::scenario::publish_handle(&format!("timeline-joint:{name}"), rect.center());
         if app.tree.picked_joints.contains(&id) {
-            ui.painter().rect_filled(rect, 3.0, t.accent_soft);
+            ui.painter().rect_filled(rect, t.radius_sm.saturating_sub(1), t.accent_soft);
         } else if response.hovered() {
-            ui.painter().rect_filled(rect, 3.0, t.hover);
+            ui.painter().rect_filled(rect, t.radius_sm.saturating_sub(1), t.hover);
         }
         let icon = egui::Rect::from_min_size(egui::pos2(rect.left() + 4.0, rect.top() + 4.0), vec2(22.0, 22.0));
-        crate::icons::paint(ui.painter(), icon, "joint", if suppressed { t.border } else { t.icon }, t.icon_fill, t.accent);
+        crate::icons::paint_icon(ui.painter(), icon, "joint", f32::from((if suppressed { t.border } else { t.icon }).a()) / 255.0);
         if suppressed {
             ui.painter().line_segment([icon.left_bottom(), icon.right_top()], Stroke::new(1.5, t.text_dim));
         }
@@ -1296,7 +1297,7 @@ pub fn timeline_joints_vertical(app: &mut SolveApp, ui: &mut egui::Ui) {
         if response.secondary_clicked() && !app.tree.picked_joints.contains(&id) {
             pick_joint(app, id, false);
         }
-        response.context_menu(|ui| joint_menu(app, ui, (id, kind, suppressed), &mut open, &mut run));
+        crate::ui_kit::Menu::context(&response, |ui| joint_menu(app, ui, (id, kind, suppressed), &mut open, &mut run));
     }
     if let Some((command, params)) = run {
         if command == "selection.delete" {

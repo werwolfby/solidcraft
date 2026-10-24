@@ -3,7 +3,7 @@
 
 use serde_json::{Value, json};
 use solidcraft_geom::Vec2;
-use solidcraft_sketch::{ConstraintKind, CurveKind, LinkKind, LinkSource, Sketch, TextAlign, TextExprs, TextStyle};
+use solidcraft_sketch::{ConstraintKind, CurveKind, LinkKind, LinkSource, Shape, Sketch, TextAlign, TextExprs, TextStyle};
 
 /// The style parameters of `sketch.text` and `sketch.edit_text`.
 macro_rules! text_style_doc {
@@ -59,7 +59,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .at("SKETCH", "CREATE")
         .icon("arc_slot_center")
         .enabled(in_sketch)
-        .params(concat!("center, start: centre arc start, end: direction of the centre arc end (counter-clockwise), width", created_doc!())),
+        .params(concat!("center, start: centre arc start, end: direction of the centre arc end (counter-clockwise) or sweep: degrees (0 < sweep < 360), width; returns centre_arc", created_doc!())),
     CommandSpec::new("sketch.ellipse", "Ellipse", ellipse).at("SKETCH", "CREATE").icon("ellipse").enabled(in_sketch).params(concat!(
         "center, major: end of the major axis [x,y], minor: a point the ellipse passes through on the minor side [x,y] | minor_radius",
         created_doc!()
@@ -822,6 +822,39 @@ fn guess_radius(sk: &Sketch, curves: &[usize], at: Vec2) -> f64 {
     if r.is_finite() && r > 1e-6 { r } else { 1.0 }
 }
 
+/// Where the centre of a circle of radius `d` touching `sh` can lie: the line moved `d` to either
+/// side, or the circle grown and shrunk by `d` (arcs as their full circle).
+fn centre_paths(sh: &Shape, d: f64) -> Vec<Shape> {
+    match *sh {
+        Shape::Line { a, b } => {
+            (b - a).normalized().map(|u| [d, -d].map(|s| Shape::Line { a: a + u.perp() * s, b: b + u.perp() * s }).to_vec()).unwrap_or_default()
+        }
+        Shape::Round { c, r, .. } => [r + d, (r - d).abs()]
+            .into_iter()
+            .filter(|x| *x > 1e-12)
+            .map(|r| Shape::Round { c, r, start: 0.0, sweep: std::f64::consts::TAU })
+            .collect(),
+    }
+}
+
+/// The centre nearest `near` of a circle of radius `r` touching curves `a` and `b` (#3141): the
+/// solver starts from the answer instead of from the click, which lies on a curve, where the
+/// tangency has no side yet and the solve fails or moves the curves.
+fn tangent_centre(sk: &Sketch, a: usize, b: usize, r: f64, near: Vec2) -> Option<Vec2> {
+    let (sa, sb) = (sk.shape(a)?, sk.shape(b)?);
+    let mut best: Option<Vec2> = None;
+    for x in centre_paths(&sa, r) {
+        for y in centre_paths(&sb, r) {
+            for q in solidcraft_sketch::intersections_within(&x, &y, 1e-9 * (1.0 + r)) {
+                if q.x.is_finite() && q.y.is_finite() && best.is_none_or(|b| q.dist(near) < b.dist(near)) {
+                    best = Some(q);
+                }
+            }
+        }
+    }
+    best
+}
+
 fn tangent_curves(sk: &Sketch, p: &Value, cmd: &str, n: usize) -> Result<Vec<usize>> {
     let ids = string_list(p, "curves");
     if ids.len() != n {
@@ -842,10 +875,14 @@ fn tangent_circle(s: &mut Session, p: &Value, cmd: &str, n: usize, radius: Optio
         if !(r0 > 1e-9 && r0 < 1e8) {
             return Err(bad(cmd, "radius must be positive"));
         }
-        // Start where the circle already nearly touches: move the centre so the guessed circle
-        // sits between the curves.
+        // Start where the circle already touches when that can be worked out (two curves and a
+        // radius), so that only the new circle moves.
+        let start = match cs.as_slice() {
+            [a, b] if radius.is_some() => tangent_centre(sk, *a, *b, r0, near).unwrap_or(near),
+            _ => near,
+        };
         let first_new = sk.points.len();
-        let c = sk.add_circle(near, r0, None, None)?;
+        let c = sk.add_circle(start, r0, None, None)?;
         let mut cons = Vec::new();
         for k in &cs {
             cons.push(add_c(sk, ConstraintKind::Tangent { a: *k, b: c })?);
@@ -900,6 +937,7 @@ fn arc_slot(s: &mut Session, p: &Value, cmd: &str, o: Vec2, r: f64, t0: f64, swe
     }
     let t1 = t0 + sweep;
     let at = |t: f64, rr: f64| o + Vec2::from_angle(t) * rr;
+    let mut centre_arc = None;
     let (out, info) = edit(s, p, cmd, false, |sk, _| {
         let oc = sk.add_point(o, None)?;
         let ps = sk.add_point(at(t0, r), None)?;
@@ -913,6 +951,7 @@ fn arc_slot(s: &mut Session, p: &Value, cmd: &str, o: Vec2, r: f64, t0: f64, swe
         let centre = sk.add_arc(o, at(t0, r), at(t1, r), [Some(oc), Some(ps), Some(pe)], None)?;
         if let Some(c) = sk.curves.get_mut(centre) {
             c.construction = true;
+            centre_arc = Some(c.id.clone());
         }
         let mut cons = Vec::new();
         for (a, b) in [(outer, cap_e), (inner, cap_e), (outer, cap_s), (inner, cap_s)] {
@@ -921,7 +960,9 @@ fn arc_slot(s: &mut Session, p: &Value, cmd: &str, o: Vec2, r: f64, t0: f64, swe
         cons.push(add_c(sk, ConstraintKind::Equal { a: cap_s, b: cap_e })?);
         Ok((ids_of(sk, &[outer, cap_e, inner, cap_s]), cons))
     })?;
-    Ok(result(out, info))
+    let mut out = result(out, info);
+    out["centre_arc"] = json!(centre_arc);
+    Ok(out)
 }
 
 fn arc_slot_three(s: &mut Session, p: &Value) -> Result<Value> {
@@ -938,14 +979,22 @@ fn arc_slot_three(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn arc_slot_center(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sketch.slot.arc_center";
-    let (o, a, b) = (req_vec2(cmd, p, "center")?, req_vec2(cmd, p, "start")?, req_vec2(cmd, p, "end")?);
+    let (o, a) = (req_vec2(cmd, p, "center")?, req_vec2(cmd, p, "start")?);
     let w = width(p, cmd)?;
     let r = o.dist(a);
-    if r < 1e-9 || o.dist(b) < 1e-9 {
+    if r < 1e-9 {
         return Err(bad(cmd, "the points must differ from the centre"));
     }
     let t0 = (a - o).angle();
-    let sweep = ((b - o).angle() - t0).rem_euclid(std::f64::consts::TAU);
+    let sweep = if p.get("sweep").is_some() {
+        num(p, "sweep").ok_or_else(|| bad(cmd, "`sweep` must be finite degrees"))?.to_radians()
+    } else {
+        let b = req_vec2(cmd, p, "end")?;
+        if o.dist(b) < 1e-9 {
+            return Err(bad(cmd, "the points must differ from the centre"));
+        }
+        ((b - o).angle() - t0).rem_euclid(std::f64::consts::TAU)
+    };
     arc_slot(s, p, cmd, o, r, t0, sweep, w)
 }
 

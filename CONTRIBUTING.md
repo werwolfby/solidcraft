@@ -15,6 +15,15 @@ Before choosing a task, check the [command inventory](docs/features.md) and
 
 Questions, ideas or want to say what you're working on? Join the [Discord](https://discord.gg/FtU4NQNVDH).
 
+## Kernel work is paused
+
+We're evaluating a new geometry kernel. Until that's decided, please don't open issues, pull
+requests or discussions about kernel work: booleans, fillets, chamfers, shell, offsets, sweeps and
+lofts, threads and holes, STEP/IGES import and export, tessellation, or anything else that changes
+`crates/kernel/`. The pinned issue on the tracker explains it. New ones get the `kernel-paused`
+label (`.github/workflows/kernel-paused.yml`) and a maintainer answers them. Crashes and data loss
+are still taken as issues, and everything outside the kernel carries on as normal.
+
 ## Get it running (about 10 minutes on a fast machine)
 
 You need stable Rust 1.95 or newer (required by egui/eframe 0.36). For the web
@@ -177,8 +186,14 @@ no LTO, and debug assertions off (truck has debug-only assertions that reject va
 builds several times faster than `--release`. If a test fails only in a plain debug build, say so
 in the PR. `cargo xtask test` builds the tests with it and then runs every test binary at once
 (`cargo test` runs them one after another); arguments after `--` go to each binary, e.g.
-`cargo xtask test -- shell`. Tests run beside each other on a busy machine, so a test must not
-depend on wall-clock timing.
+`cargo xtask test -- shell`. Set `SOLIDCRAFT_TEST_JOBS` to a positive integer to opt into a
+shared bound on top-level test/side commands for `cargo xtask test` and `cargo xtask ci`.
+For example, `SOLIDCRAFT_TEST_JOBS=2` allows two commands at once; the sequential wasm/doc
+worker consumes one of those slots. Every binary and side check still runs after failures.
+Without the variable the existing concurrency is unchanged. `RUST_TEST_THREADS`,
+`ACTION_MATRIX_JOBS` and Cargo's build-job setting remain independent caller overrides;
+this limit does not choose their values or change test filters, timeouts or baselines.
+Tests run beside each other on a busy machine, so a test must not depend on wall-clock timing.
 
 **Ready pull requests test what they touch.** CI maps changed files to workspace packages and
 runs Clippy, the test build and tests for those and their dependents. The
@@ -199,7 +214,7 @@ Check that validation after merging. They are listed in
 `.config/nextest.toml` and the [testing page](docs/book/src/dev/testing.md):
 
 - `solidcraft-engine`: `tests::hostile_params_never_panic`, everything in `tests::robustness` and
-  the seeds of `tests::robustness_goldens` (`seed_00` … `seed_95`; pull requests matching the workflow's geometry paths run all but the slowest, `SLOW_SEEDS` in `ci.yml`),
+  the seeds of `tests::robustness_goldens` (`seed_00` … `seed_95`; pull requests that change the kernel, truck or the goldens run all but the slowest, `SLOW_SEEDS` in `ci.yml`),
   `pattern_suppress_tests::enclosure_arc_extinction_keeps_a_real_sharp_inner_lip_after_resize_and_reopen`,
   `pattern_suppress_tests::enclosure_datums_follow_wall_height_and_board_depth_with_material_proofs`,
   `cmd::plastic::tests::enclosure_snap_fit_follows_resized_front_wall`, the `atomic_commands` contract tests

@@ -1,6 +1,7 @@
 //! Ribbon-anchored command search. Ranking comes from the registry; document results use
 //! existing feature-edit and parameter commands. JSON mode never starts an interactive tool.
 
+use crate::ui_kit::{Container, Surface};
 use egui::{Pos2, Rect, pos2, vec2};
 use serde_json::{Value, json};
 use solidcraft_engine::command_specs;
@@ -105,6 +106,24 @@ pub fn score(q: &str, s: &str) -> u32 {
     300u32.saturating_sub(gaps * 20).max(10)
 }
 
+/// Words people look for a command by that its name doesn't hold (file formats, what it is for).
+fn keywords(id: &str) -> &'static str {
+    match id {
+        "file.save_mesh" => "export stl 3mf mesh 3d print printing slicer",
+        "file.export" => "export stl 3mf obj step urdf mesh 3d print",
+        _ => "",
+    }
+}
+
+/// How well `q` matches a command's `keywords`: every word of the query starts a keyword.
+fn keyword_score(q: &str, keywords: &str) -> u32 {
+    if keywords.is_empty() || q.is_empty() {
+        return 0;
+    }
+    let words = || keywords.split_whitespace();
+    if q.split_whitespace().all(|w| words().any(|k| k.starts_with(w))) { 700 } else { 0 }
+}
+
 /// A row of the box: the command id, its label, its icon, and where it lives on the toolbar
 /// (tab, panel; `None` off the toolbar), in the current language.
 pub type Row = (&'static str, &'static str, &'static str, Option<(&'static str, &'static str)>);
@@ -118,6 +137,7 @@ pub fn search(app: &SolveApp, q: &str) -> Vec<Row> {
     let q = q.trim().to_lowercase();
     let mut v: Vec<(u32, Row)> = command_specs()
         .into_iter()
+        .filter(|c| !crate::workspace::AGENT_ONLY.contains(&c.id))
         .filter_map(|c| {
             let (home_tab, home_panel) = crate::workspace::destination(c).unwrap_or(("", ""));
             let (label, tab, panel) = (crate::i18n::tr_label(c.label), crate::i18n::tr_label(home_tab), crate::i18n::tr_label(home_panel));
@@ -125,11 +145,12 @@ pub fn search(app: &SolveApp, q: &str) -> Vec<Row> {
             let s = score(&q, label)
                 .max(score(&q, c.label))
                 .max(score(&q, c.id) * 9 / 10)
+                .max(keyword_score(&q, keywords(c.id)))
                 .max(score(&q, tab).max(score(&q, home_tab)) / 3)
                 .max(score(&q, panel).max(score(&q, home_panel)) / 3);
             let recent = app.sbox.recent.iter().position(|r| r == c.id).map_or(0, |i| 2000u32.saturating_sub(i.min(2000) as u32));
             // Commands that can run now come before those that can't.
-            let usable = if c.info(&app.session).enabled { 150 } else { 0 };
+            let usable = if crate::render_workspace::interactive_command_info(app, c).enabled { 150 } else { 0 };
             (s > 0).then_some((s + usable + if q.is_empty() { recent } else { recent / 20 }, (c.id, label, c.icon, place)))
         })
         .collect();
@@ -335,8 +356,13 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     let mut rows = Vec::new();
     let mut design = Vec::new();
     let mut mode = None;
-    let response =
-        crate::frame::area(egui::Id::new("sc_sbox")).fixed_pos(pos).order(egui::Order::Foreground).fade_in(false).constrain(false).show(ctx, |ui| {
+    let response = Container::new(ctx, Surface::Popup)
+        .area(egui::Id::new("sc_sbox"))
+        .fixed_pos(pos)
+        .order(egui::Order::Foreground)
+        .fade_in(false)
+        .constrain(false)
+        .show(ctx, |ui| {
             // Area rounds its origin; place the child at the exact interpolated bounds
             // so the field's right edge does not drift during expansion.
             ui.scope_builder(egui::UiBuilder::new().max_rect(Rect::from_min_size(pos, vec2(field_size.x, height + field_size.y))), |ui| {
@@ -354,7 +380,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                         ui_kit::SearchFieldGeometry {
                             height: field_size.y,
                             progress,
-                            radius: ui_kit::CommandSearch::field_radius(progress, app.ui.layout == crate::shell::LayoutMode::Floating),
+                            radius: ui_kit::CommandSearch::field_radius(progress, ui_kit::Container::new(ctx, ui_kit::Surface::Chrome).floating()),
                         },
                         MAX_QUERY,
                     );
@@ -389,7 +415,9 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                     }
                     let enabled: Vec<_> = rows
                         .iter()
-                        .map(|r| solidcraft_engine::find_command(r.0).is_some_and(|c| c.info(&app.session).enabled))
+                        .map(|r| {
+                            solidcraft_engine::find_command(r.0).is_some_and(|c| crate::render_workspace::interactive_command_info(app, c).enabled)
+                        })
                         .chain(design.iter().map(|_| true))
                         .take(MAX_RESULTS)
                         .collect();
@@ -454,7 +482,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                                         let mut item = ui_kit::MenuItem::new(id, label, icon);
                                         item.enabled = enabled.get(index).copied().unwrap_or(false);
                                         item.highlighted = index == app.sbox.index;
-                                        let shortcut = crate::keymap::effective(app, id).unwrap_or_default();
+                                        let shortcut = crate::keymap::display_for(app, id).unwrap_or_default();
                                         item.shortcut = &shortcut;
                                         let path = place.map_or_else(|| id.to_string(), |(tab, panel)| format!("{tab} › {panel}"));
                                         let response = item.search_row(ui, &query, &path, None);
@@ -554,7 +582,10 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
             }
         } else {
             let index = picked.unwrap_or(app.sbox.index);
-            if let Some((id, ..)) = rows.get(index).filter(|r| solidcraft_engine::find_command(r.0).is_some_and(|c| c.info(&app.session).enabled)) {
+            if let Some((id, ..)) = rows
+                .get(index)
+                .filter(|r| solidcraft_engine::find_command(r.0).is_some_and(|c| crate::render_workspace::interactive_command_info(app, c).enabled))
+            {
                 app.sbox.used(id);
                 close(app);
                 app.start(id);
@@ -637,6 +668,15 @@ mod tests {
         let mut other = SolveApp::new(solidcraft_engine::Session::default(), Default::default());
         other.sbox.load(&app.sbox.prefs());
         assert_eq!((other.sbox.pinned.clone(), other.sbox.recent.len()), (vec!["solid.extrude".to_string()], 2));
+    }
+
+    #[test]
+    fn solve_sketch_is_not_offered_but_the_command_remains() {
+        let app = SolveApp::new(solidcraft_engine::Session::default(), Default::default());
+        for q in ["solve", "sketch.solve", ""] {
+            assert!(!search(&app, q).iter().any(|x| x.0 == "sketch.solve"), "{q:?}");
+        }
+        assert!(solidcraft_engine::find_command("sketch.solve").is_some(), "agents and MCP keep it");
     }
 
     /// The box shows each command's label and place in the current language, and finds a name

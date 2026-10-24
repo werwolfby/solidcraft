@@ -85,6 +85,27 @@ fn feature_mirror_and_patterns_reopen_as_feature_replays_even_for_body_creators(
     }
 }
 
+/// #3567: an Offset Plane built on a face reopened with its Plane input empty when the face's
+/// plane origin lay off the face (here the world origin's foot, beside the box), so OK asked to
+/// pick a plane first. It reopens with the face, and OK keeps the plane on it.
+#[test]
+fn offset_plane_on_a_face_reopens_with_the_face() {
+    let mut app = app_with(json!([
+        {"command":"solid.box","params":{"length":40,"width":30,"height":20,"corner":[10,0,0],"body_name":"Plate"}},
+        {"command":"construct.plane.offset","params":{"base":{"face":[30,0,10]},"offset":10,"name":"Side"}}
+    ]));
+    let side = app.session.doc.find_feature("Side").unwrap().clone();
+    let d = crate::dialogs::for_feature(&app, side.id, None).unwrap();
+    assert!(matches!(d.inputs[0].items.as_slice(), [Sel::Face { body, .. }] if body == "Plate"), "{:?}", d.inputs[0].items);
+    let (edit, p) = apply_commands(&app, &d).unwrap().remove(0);
+    assert_eq!(edit, "timeline.redefine");
+    app.session.execute(&edit, &p).unwrap();
+    assert!(app.session.model.results.iter().all(|r| r.error.is_none()), "{:?}", app.session.model.results);
+    let state = app.session.model.state();
+    let plane = state.construct.iter().find(|c| c.name == "Side").map(|c| c.geom.clone());
+    assert!(matches!(plane, Some(solidcraft_engine::doc::construct::ConstructGeom::Plane(pl)) if (pl.origin.y + 10.0).abs() < 1e-9), "{plane:?}");
+}
+
 #[test]
 fn feature_pattern_controls_preview_without_committing_and_cancel_cleanly() {
     for command in ["solid.pattern.rectangular", "solid.pattern.circular"] {
@@ -249,7 +270,7 @@ fn path_plane_click_retains_source_and_previews_then_edits_in_place() {
     let duplicate = h.app.run("sketch.line3d", json!({"points":[[-30,0,0],[-20,0,0]]})).unwrap()["curves"][0].as_str().unwrap().to_string();
     assert_eq!(wire, duplicate, "exercise duplicate curve ids in different sketches");
     h.app.run("sketch.finish", json!({})).unwrap();
-    h.app.ui.show_origin = false;
+    h.app.set_origin_shown(false);
     h.settle();
     h.call("ui.view", json!({"view":"home"}));
     h.call("ui.view", json!({"view":"fit"}));
@@ -383,7 +404,7 @@ fn cylinder_emboss_target_face_and_edit_keep_the_anchored_operation() {
 #[test]
 fn cylinder_emboss_edit_retains_second_source_and_author_paths_and_all_profiles() {
     let mut h = crate::scenario::Harness::new();
-    let source = h.app.run("component.create", json!({"name":"Source"})).unwrap()["component"].as_u64().unwrap();
+    let source = h.app.run("component.create", json!({"name":"Source","grounded":false})).unwrap()["component"].as_u64().unwrap();
     h.app.run("solid.cylinder", json!({"radius":10,"height":20,"body_name":"Sleeve"})).unwrap();
     h.app.run("occurrence.move", json!({"occurrence":"Source:1","axis":[0,0,1],"angle":"90 deg","translate":[50,0,0]})).unwrap();
     let source_second = h.app.run("occurrence.copy", json!({"component":source,"translate":[80,0,0]})).unwrap()["occurrence"].as_u64().unwrap();
@@ -478,7 +499,11 @@ fn cylinder_emboss_edit_retains_second_source_and_author_paths_and_all_profiles(
 fn cylinder_emboss_profile_guide_uses_target_or_unique_foreign_sketch_frame() {
     for target_owned in [true, false] {
         let mut h = crate::scenario::Harness::new();
-        let source = if target_owned { h.app.run("component.create", json!({"name":"Source"})).unwrap()["component"].as_u64().unwrap() } else { 0 };
+        let source = if target_owned {
+            h.app.run("component.create", json!({"name":"Source","grounded":false})).unwrap()["component"].as_u64().unwrap()
+        } else {
+            0
+        };
         h.app.run("solid.cylinder", json!({"radius":10,"height":20,"body_name":"Sleeve"})).unwrap();
         let (profile_owner, expected, target, face) = if target_owned {
             h.app.run("occurrence.move", json!({"occurrence":"Source:1","axis":[0,0,1],"angle":"90 deg","translate":[50,0,0]})).unwrap();
@@ -486,7 +511,7 @@ fn cylinder_emboss_profile_guide_uses_target_or_unique_foreign_sketch_frame() {
             let target = h.app.session.occurrence_bodies(&[second], false).unwrap().remove(0);
             (source, Vec3::new(120.0, 0.0, 0.0), target, json!([120, 0, 7.5]))
         } else {
-            let profile = h.app.run("component.create", json!({"name":"Profile"})).unwrap()["component"].as_u64().unwrap();
+            let profile = h.app.run("component.create", json!({"name":"Profile","grounded":false})).unwrap()["component"].as_u64().unwrap();
             h.app.run("occurrence.move", json!({"occurrence":"Profile:1","axis":[0,0,1],"angle":"90 deg","translate":[50,20,0]})).unwrap();
             (profile, Vec3::new(0.0, 10.0, 0.0), "Sleeve".to_string(), json!([0, 10, 7.5]))
         };
@@ -712,6 +737,56 @@ fn face_then_extrude_press_pulls_it() {
     let d = start(&mut app, vec![top], "solid.extrude");
     let cmds = apply_commands(&app, &d).unwrap();
     assert!(cmds[0].1.get("face").is_some());
+}
+
+/// Press Pull on a hole's wall offsets it, rather than refusing it as Extrude does (#2873).
+#[test]
+fn curved_face_then_press_pull_offsets_it() {
+    let mut app = app_with(json!([
+        {"command": "solid.box", "params": {"length": 40, "width": 30, "height": 20}},
+        {"command": "solid.cylinder", "params": {"radius": 5, "height": 20, "base": [20, 15, 0], "operation": "cut"}}
+    ]));
+    let st = app.session.model.state();
+    let wall = st.body("Body1").unwrap().body.faces(0.01).unwrap().into_iter().find(|f| f.plane_normal.is_none()).unwrap().index;
+    drop(st);
+    let d = start(&mut app, vec![Sel::Face { body: "Body1".into(), index: wall, point: Vec3::new(25.0, 15.0, 10.0) }], "solid.press_pull");
+    assert!(matches!(d.kind, Kind::OffsetFaces { .. }));
+    let cmds = apply_commands(&app, &d).unwrap();
+    assert_eq!(cmds[0].0, "solid.offset_face");
+}
+
+/// Press Pull with nothing selected: a click on a hole's wall reopens it as Offset Face, a click
+/// on the top keeps the extrude (#2873).
+#[test]
+fn press_pull_then_curved_face_offsets_it() {
+    let script = json!([
+        {"command": "solid.box", "params": {"length": 40, "width": 30, "height": 20}},
+        {"command": "solid.cylinder", "params": {"radius": 5, "height": 20, "base": [20, 15, 0], "operation": "cut"}}
+    ]);
+    let mut app = app_with(script.clone());
+    let st = app.session.model.state();
+    let wall = st.body("Body1").unwrap().body.faces(0.01).unwrap().into_iter().find(|f| f.plane_normal.is_none()).unwrap().index;
+    drop(st);
+    app.start("solid.press_pull");
+    assert!(matches!(app.dialog.as_ref().unwrap().kind, Kind::Extrude { .. }));
+    let p = Vec3::new(25.0, 15.0, 10.0);
+    let hit = crate::viewport::Hit::Face { body: "Body1".into(), index: wall, point: p };
+    crate::viewport::dialog_pick(&mut app, &hit, Sel::Face { body: "Body1".into(), index: wall, point: p });
+    let d = app.dialog.clone().unwrap();
+    assert!(matches!(d.kind, Kind::OffsetFaces { .. }));
+    // Both halves of the hole's wall.
+    assert_eq!(d.inputs[0].items.len(), 2);
+
+    let mut app = app_with(script);
+    app.start("solid.press_pull");
+    let top = face(&app, Vec3::new(20.0, 15.0, 20.0));
+    let hit = crate::viewport::Hit::Face {
+        body: "Body1".into(),
+        index: if let Sel::Face { index, .. } = &top { *index } else { 0 },
+        point: Vec3::new(5.0, 5.0, 20.0),
+    };
+    crate::viewport::dialog_pick(&mut app, &hit, top);
+    assert!(matches!(app.dialog.as_ref().unwrap().kind, Kind::Extrude { .. }));
 }
 
 #[test]
@@ -961,6 +1036,43 @@ fn shell_direction_and_tangent_chain_round_trip() {
     let e = crate::dialogs::for_feature(&app, id, None).unwrap();
     assert_eq!(e.extra.get("direction"), Some(&json!("outside")));
     assert_eq!(e.extra.get("tangent_chain"), Some(&json!(true)));
+}
+
+#[test]
+fn shell_tangent_chain_highlights_and_counts_faces_without_saving_extra_picks() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.run("solid.box", json!({"length":40,"width":30,"height":20})).unwrap();
+    h.app.run("solid.fillet", json!({"edges":[[20,0,20]],"radius":4})).unwrap();
+    let top = face(&h.app, Vec3::new(20.0, 17.0, 20.0));
+    start(&mut h.app, vec![top.clone()], "solid.shell");
+    h.frames(3);
+    let shown = |app: &SolveApp| -> std::collections::BTreeSet<usize> {
+        app.highlighted()
+            .into_iter()
+            .filter_map(|sel| match sel {
+                Sel::Face { index, .. } => Some(index),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(shown(&h.app).len(), 3, "the top, round and front are one tangent chain");
+    assert!(h.widget("3 selected").is_some());
+    let d = h.app.dialog.as_ref().unwrap();
+    assert_eq!(d.inputs[0].items, vec![top.clone()]);
+    assert_eq!(apply_commands(&h.app, d).unwrap()[0].1["faces"].as_array().unwrap().len(), 1);
+
+    h.step(&json!({"click":{"handle":"dialog:Tangent Chain"}})).unwrap();
+    h.frames(3);
+    assert_eq!(shown(&h.app).len(), 1);
+    assert!(h.widget("1 selected").is_some());
+    assert_eq!(h.app.dialog.as_ref().unwrap().inputs[0].items, vec![top]);
+
+    h.step(&json!({"click":{"handle":"dialog:Tangent Chain"}})).unwrap();
+    h.frames(3);
+    assert_eq!(shown(&h.app).len(), 3);
+    h.step(&json!({"click":{"handle":"dialog:clear:Faces/Body"}})).unwrap();
+    h.frames(3);
+    assert!(h.app.dialog.as_ref().unwrap().highlighted(&h.app.session).is_empty(), "clear must also clear the expanded highlight");
 }
 
 #[test]
@@ -1324,7 +1436,10 @@ fn thread_choices_can_start_without_a_face_and_recover_from_invalid_text() {
     h.call("ui.scroll", json!({"x":first.x,"y":first.y,"delta":-60}));
     h.frames(12);
     h.step(&json!({"click":{"handle":"dialog:Size:8 mm"}})).unwrap();
-    assert!(matches!(&h.app.dialog.as_ref().unwrap().kind, Kind::Thread { designation, .. } if designation == "M8x1.25"));
+    assert!(matches!(&h.app.dialog.as_ref().unwrap().kind, Kind::Thread { designation, .. } if designation == "M8"));
+    if let Kind::Thread { designation, .. } = &h.app.dialog.as_ref().unwrap().kind {
+        assert_eq!(solidcraft_engine::doc::parse_metric_thread(designation), Some((8.0, 1.25)));
+    }
     assert!(apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).is_err(), "a face is still required");
 }
 
@@ -1351,7 +1466,19 @@ fn modelled_thread_preview_updates_reports_errors_and_cancels_without_changes() 
     designation(&mut h, "M8x1.3");
     wait_feature_preview(&mut h);
     assert_ne!(h.app.preview.key, first_key, "changing pitch updates the preview before OK");
+    // An 8 mm shaft is turned down for an M6.
+    let m8_key = h.app.preview.key;
     designation(&mut h, "M6x1.3");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while h.app.preview.key == m8_key && std::time::Instant::now() < deadline {
+        h.frames(2);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    wait_feature_preview(&mut h);
+    assert!(h.app.preview.error.is_none(), "{:?}", h.app.preview.error);
+    assert_eq!(h.app.preview.replaced, ["Body1"]);
+    // A shaft thinner than the thread is still refused.
+    designation(&mut h, "M10x1.5");
     for _ in 0..500 {
         h.frames(2);
         if !h.app.preview.busy && h.app.preview.error.is_some() {
@@ -1361,7 +1488,7 @@ fn modelled_thread_preview_updates_reports_errors_and_cancels_without_changes() 
     }
     assert!(h.app.preview.error.as_deref().is_some_and(|e| e.contains("does not fit")), "{:?}", h.app.preview.error);
     designation(&mut h, "M8x1.3");
-    // The M6 error stays until the new preview starts; wait for it to go, or
+    // The M10 error stays until the new preview starts; wait for it to go, or
     // `wait_feature_preview` would stop at the stale error on a host that schedules the
     // preview a few frames later.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
@@ -1404,8 +1531,9 @@ fn newer_options_reach_their_commands() {
     app.dialog = None;
     let top = face(&app, Vec3::new(20.0, 15.0, 20.0));
     let mut d = start(&mut app, vec![top], "solid.hole");
-    d.inputs.push(crate::selection::SelInput::new("To Object", crate::selection::FACES | crate::selection::VERTICES, false));
-    d.inputs[1].items = vec![face(&app, Vec3::new(20.0, 15.0, 0.0))];
+    let mut to = crate::selection::SelInput::new("To Object", crate::selection::FACES | crate::selection::VERTICES, false);
+    to.items = vec![face(&app, Vec3::new(20.0, 15.0, 0.0))];
+    d.inputs.push(to);
     let p = apply_commands(&app, &d).unwrap().remove(0).1;
     assert!(p["to"].is_array() && p.get("depth").is_none(), "{p}");
 }
@@ -1449,6 +1577,32 @@ fn align_snaps_to_centres_and_edge_middles() {
     let p = apply_commands(&app, &d).unwrap().remove(0).1;
     assert_eq!(p["from"]["snap"], json!("face_center"));
     assert_eq!(p["to"]["snap"], json!("edge_mid"));
+}
+
+/// The Align dialog takes a plane (viewport or browser click) and the origin plane stays a plane
+/// in the command, so the bodies follow it when it moves.
+#[test]
+fn align_accepts_a_plane_click() {
+    let mut app = boxed();
+    let mut d = start(&mut app, vec![], "solid.align");
+    d.inputs[0].items = vec![Sel::Body { name: "Body1".into() }];
+    d.inputs[1].items = vec![face(&app, Vec3::new(20.0, 15.0, 0.0))];
+    let plane = crate::viewport::Hit::Plane { name: "XZ".into(), point: Vec3::ZERO };
+    d.active = 2;
+    let sel = d.candidate(&app.session, &plane);
+    assert_eq!(sel, Some(Sel::Plane { name: "XZ".into() }), "the To input takes a plane");
+    d.pick(&app.session, sel.unwrap());
+    let p = apply_commands(&app, &d).unwrap().remove(0).1;
+    assert_eq!(p["to_plane"], json!("XZ"));
+    assert!(p.get("to").is_none() && p["from_face"].is_array());
+    // The origin point is a From/To too.
+    let origin = crate::viewport::Hit::Vertex { body: String::new(), point: Vec3::ZERO };
+    let sel = d.candidate(&app.session, &origin);
+    assert!(sel.is_some(), "the To input takes the origin point");
+    d.inputs[2].items.clear();
+    d.pick(&app.session, sel.unwrap());
+    let p = apply_commands(&app, &d).unwrap().remove(0).1;
+    assert_eq!(p["to"], json!("origin"));
 }
 
 #[test]
@@ -2172,4 +2326,44 @@ fn hovering_a_large_body_does_not_wait_for_its_pick_index() {
     let hover_ms = t.elapsed().as_secs_f64() * 1000.0;
     assert!(matches!(h.app.viewport.hover, Some(crate::viewport::Hit::Face { .. })), "{:?}", h.app.viewport.hover);
     assert!(hover_ms < index_ms / 3.0, "the first hover took {hover_ms:.1} ms; making the index takes {index_ms:.1} ms");
+}
+
+/// #4452: with Combine open, bodies clicked in the Browser fill its inputs, as clicks on them
+/// in the view do: the first is the target, the next the tools. Overlapping bodies are often
+/// only told apart in the Browser.
+#[test]
+fn combine_takes_bodies_clicked_in_the_browser() {
+    for layout in ["docked", "floating"] {
+        for control in [false, true] {
+            combine_takes_bodies_clicked_in_the_browser_in(layout, control);
+        }
+    }
+}
+
+/// `control`: click the rows as the control channel's `ui.click` does (move, press and release
+/// in one frame), as an agent or a live screenshot run does.
+fn combine_takes_bodies_clicked_in_the_browser_in(layout: &str, control: bool) {
+    let mut h = crate::scenario::Harness::new();
+    h.step(&json!({"call": "ui.set", "params": {"layout": layout}})).unwrap();
+    h.frames(2);
+    h.app.run("solid.box", json!({"corner": [0, 0, 0], "length": 20, "width": 20, "height": 20, "body_name": "Block"})).unwrap();
+    h.app.run("solid.box", json!({"corner": [10, 10, 10], "length": 20, "width": 20, "height": 20, "body_name": "Cutter"})).unwrap();
+    h.app.session.selection.clear();
+    h.app.start("solid.combine");
+    h.frames(2);
+    for label in ["Block", "Cutter"] {
+        if control {
+            let rows = h.call("ui.handles", json!({"prefix": "row:"}))["result"].clone();
+            let rows = rows.get("handles").cloned().unwrap_or(rows);
+            let row = rows.as_array().unwrap().iter().find(|r| r["name"] == format!("row:{label}")).cloned().unwrap();
+            h.call("ui.click", json!({"x": row["x"], "y": row["y"]}));
+            h.frames(2);
+        } else {
+            h.step(&json!({"click": {"browser": label}})).unwrap();
+            h.frames(1);
+        }
+    }
+    let d = h.app.dialog.as_ref().expect("Combine stays open");
+    assert_eq!(d.inputs[0].items, vec![Sel::Body { name: "Block".into() }], "{layout} control={control} target: {:?}", d.inputs);
+    assert_eq!(d.inputs[1].items, vec![Sel::Body { name: "Cutter".into() }], "{layout} control={control} tools: {:?}", d.inputs);
 }

@@ -4,7 +4,9 @@
 //! then glides to each pick in the parameters (faces, edges and points projected to the screen,
 //! sketch points, the plane of a new sketch), and only then does the command run. The reply
 //! waits for the animation, so an agent's timing stays honest. With "follow camera" on, a new
-//! sketch turns the view to face it and finishing the sketch turns back.
+//! sketch turns the view to face it and finishing the sketch turns back. Pointer input the agent
+//! sends itself (`ui.move`, `ui.click`, `ui.drag`, `ui.scroll`) moves the pointer too, as each
+//! event reaches the app, and a press leaves a ripple.
 //!
 //! The show is bounded, whatever the request's size: besides the toolbar button the pointer
 //! visits at most [`MAX_PICK_STOPS`] picks (a long point list is summarised by its first, middle
@@ -140,6 +142,9 @@ pub struct Job {
     started: f64,
     /// Clicked at the current stop (waiting out the click).
     clicked: bool,
+    /// The command computing ahead off the window thread while the pointer glides (#1989): at
+    /// its last stop the pointer waits for it, then the command runs and finds it in the cache.
+    ahead: Option<crate::control_job::Ahead>,
 }
 
 /// The pointer's state.
@@ -157,6 +162,32 @@ impl AgentCursor {
     /// A request is being acted out (later requests wait behind it).
     pub fn busy(&self) -> bool {
         self.job.is_some()
+    }
+
+    /// Since when the pointer has waited at its last stop for its command to compute (ms), and
+    /// the command.
+    pub fn computing(&self) -> Option<(f64, &str)> {
+        self.job.as_ref().filter(|j| j.stops.is_empty()).and_then(|j| j.ahead.as_ref()).map(|a| (a.started, a.label.as_str()))
+    }
+
+    /// Follow the pointer input an agent sends itself (`ui.move`, `ui.click`, `ui.drag`,
+    /// `ui.scroll`), as it reaches the app: the pointer goes where the input lands, and a press
+    /// leaves a ripple. A request being acted out keeps the pointer meanwhile.
+    pub(crate) fn follow_input(&mut self, at: Pos2, press: bool, now: f64) {
+        if self.job.is_some() {
+            return;
+        }
+        self.pos = Some(at);
+        if press {
+            self.ripples.push((at, now));
+        }
+    }
+
+    /// Stop the request the pointer waits on: answered as stopped, nothing of it applied.
+    pub(crate) fn stop(&mut self) -> Option<(Sender<ControlResponse>, String)> {
+        self.computing()?;
+        let job = self.job.take()?;
+        Some((job.reply, job.ahead.map(|a| a.label).unwrap_or_default()))
     }
 }
 
@@ -324,6 +355,8 @@ pub fn intercept(app: &mut SolveApp, method: &str, params: &Value, reply: &Sende
         return false;
     }
     let from = app.cursor_start();
+    // Computed ahead (a command or a batch's steps) while the pointer glides (#1989).
+    let ahead = crate::control_job::Ahead::begin(app, method, params);
     let (glide, click) = leg_times(s.speed, stops.len());
     app.agent.job = Some(Job {
         method: method.to_string(),
@@ -335,6 +368,7 @@ pub fn intercept(app: &mut SolveApp, method: &str, params: &Value, reply: &Sende
         from,
         started: app.now,
         clicked: false,
+        ahead,
     });
     true
 }
@@ -362,7 +396,9 @@ pub fn step(app: &mut SolveApp, ctx: &egui::Context) {
     let (glide, click) = (job.glide, job.click);
     ctx.request_repaint();
     let Some(&to) = job.stops.front() else {
-        finish(app, ctx);
+        if job.ahead.as_ref().is_none_or(crate::control_job::Ahead::finished) {
+            finish(app, ctx);
+        }
         return;
     };
     let t = if glide > 0.0 { (now - job.started) / glide } else { 1.0 };
@@ -381,7 +417,7 @@ pub fn step(app: &mut SolveApp, ctx: &egui::Context) {
         job.from = to;
         job.started = now;
         job.clicked = false;
-        if job.stops.is_empty() {
+        if job.stops.is_empty() && job.ahead.as_ref().is_none_or(crate::control_job::Ahead::finished) {
             finish(app, ctx);
         }
     }
@@ -399,10 +435,11 @@ fn finish(app: &mut SolveApp, ctx: &egui::Context) {
         app.agent.saved_view = Some(app.cam);
     }
     let (req, _rx) = crate::control::ControlRequest::new(job.method, params);
-    let out = match crate::control::handle(app, ctx, &req) {
+    // What was computed ahead while the pointer glided is found rather than computed again here.
+    let out = app.run_with_kept(job.ahead.map(|a| a.kept), |app| match crate::control::handle(app, ctx, &req) {
         crate::control::Outcome::Done(v) => v,
         crate::control::Outcome::Screenshot { .. } => json!({"ok": false, "error": "not a command"}),
-    };
+    });
     let ran = out.get("ok").and_then(Value::as_bool).unwrap_or(false);
     if follow && ran {
         if id == "sketch.create" {
@@ -540,6 +577,29 @@ mod tests {
         let (r, frames) = h.call_queued("engine.batch", json!({"commands": [{"command": "doc.open", "params": {"path": "x.solidcraft"}}]}));
         assert!(r["error"].as_str().is_some_and(|e| e.starts_with("engine.batch unavailable")), "{r}");
         assert!(frames <= 3, "{frames}");
+    }
+
+    #[test]
+    fn the_pointer_follows_the_agents_own_mouse_input() {
+        let mut h = crate::scenario::Harness::new();
+        // Hidden: control-channel input leaves the pointer alone.
+        assert_eq!(h.call("ui.agent_cursor", json!({"show": false}))["ok"], true);
+        h.call("ui.move", json!({"x": 300, "y": 300}));
+        h.frames(2);
+        assert_eq!(h.app.agent.pos, None);
+
+        assert_eq!(h.call("ui.agent_cursor", json!({"show": true}))["ok"], true);
+        h.call("ui.move", json!({"x": 420, "y": 380}));
+        h.frames(2);
+        assert_eq!(h.app.agent.pos, Some(pos2(420.0, 380.0)), "a move moves it");
+        h.call("ui.click", json!({"x": 500, "y": 400, "button": "right"}));
+        h.frames(4);
+        assert_eq!(h.app.agent.pos, Some(pos2(500.0, 400.0)), "a click lands where it clicked");
+        assert!(h.app.agent.ripples.iter().any(|(at, _)| *at == pos2(500.0, 400.0)), "and leaves a ripple");
+        // A drag is followed (one step a frame) to where it is released.
+        h.call("ui.drag", json!({"x0": 600, "y0": 300, "x1": 700, "y1": 360, "steps": 4}));
+        h.frames(8);
+        assert_eq!(h.app.agent.pos, Some(pos2(700.0, 360.0)));
     }
 
     #[test]

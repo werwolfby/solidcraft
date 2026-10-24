@@ -5,6 +5,7 @@
 //! command has its geometry, so typing a number sets the value at once; Enter applies, Tab
 //! moves on, Esc cancels.
 
+use crate::ui_kit::{Container, Surface};
 use egui::{Color32, Pos2, Stroke, vec2};
 use solidcraft_engine::Sel;
 use solidcraft_engine::doc::expr::Kind as ValueKind;
@@ -76,6 +77,9 @@ pub fn anchor(app: &SolveApp, d: &Dialog) -> Option<(Vec3, Option<Vec3>)> {
             (ss.plane.to_world(ss.sketch.point(ss.sketch.resolve_point(point)?)?), None)
         }
         Sel::Body { name } => (st.body(name)?.mesh().bounds().center(), None),
+        // A feature picked as a whole (a pattern or mirror of features): the middle of what it
+        // made, as a body sits at the middle of its box.
+        Sel::Feature { id } => (crate::viewport::feature_bounds(app, *id)?.center(), None),
         Sel::Plane { name } => {
             let pl = solidcraft_engine::geom::Plane::named(name).or_else(|| {
                 solidcraft_engine::view::construction_planes(&app.session).into_iter().find(|(_, n, _)| n == name).map(|(_, _, pl)| pl)
@@ -115,7 +119,9 @@ pub fn anchor(app: &SolveApp, d: &Dialog) -> Option<(Vec3, Option<Vec3>)> {
             let dir = by_sketch.first().and_then(|(sk, ids)| solidcraft_engine::doc::sketch_hole_direction(&st, *sk, ids, flip));
             (at, normal.or(dir.map(|d| -d)))
         }
-        Kind::Section { .. } | Kind::OffsetPlane { .. } | Kind::OffsetFaces { .. } => (at, normal),
+        // A curved face offsets along its outward normal where it was picked.
+        Kind::OffsetFaces { .. } => (at, normal.or_else(|| solidcraft_engine::doc::hole_direction_at(&st, at).map(|d| -d))),
+        Kind::Section { .. } | Kind::OffsetPlane { .. } => (at, normal),
         // Fillet radii and chamfer distances grow the way `blend_grow_dir` gives (into the body
         // on an outside edge, into the open corner on an inside one); shell thickness grows into
         // the body.
@@ -315,6 +321,17 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj
         // picked bodies instead.
         let triad = crate::dialogs_move::triad(app, &d);
         let at = triad.map(|t| t.center).or_else(|| anchor(app, &d).map(|(base, _)| base));
+        // Tab and Shift+Tab in the box show the next or previous value (Y after X; #4776),
+        // keeping the keyboard in the box.
+        // egui moves the keyboard on with Tab before this runs: the box had it last frame.
+        let id = egui::Id::new("sc_canvas_value");
+        let boxed = ui.ctx().memory(|m| m.has_focus(id) || m.had_focus_last_frame(id));
+        let back = boxed && ui.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab));
+        let tab = boxed && !back && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab));
+        if tab || back {
+            crate::dialogs_move::step_value_field(&mut d, if back { -1 } else { 1 });
+            d.focus = true;
+        }
         let focus = std::mem::take(&mut d.focus);
         if let Some(bs) = at.and_then(|base| proj.to_screen(base))
             && let Some((label, _, value)) = d.primary()
@@ -322,7 +339,7 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj
             // Clear of the triad: its arrows reach LEN_PX and its rings RING of that, so a box
             // beside the centre would cover the handles the user is reaching for.
             let off = if triad.is_some() { vec2(crate::gizmo::LEN_PX as f32 + 16.0, -12.0) } else { vec2(16.0, -30.0) };
-            value_box(ui, label, value, bs + off, focus || dragging);
+            value_box_with(ui, label, value, bs + off, focus || dragging, true);
         }
         app.dialog = Some(d);
         return;
@@ -333,6 +350,8 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj
         draw(app, ui, painter, proj, &mut d, base, bs, dir);
     }
     app.dialog = Some(d);
+    // A Single hole's handles, over the depth arrow's stem: a press on a hole moves it.
+    crate::hole_place::show(app, ui, painter, proj);
 }
 
 /// A round step for dragged values at this zoom (1, 2 or 5 times a power of ten).
@@ -361,7 +380,7 @@ fn along(proj: &Proj, pos: Pos2, base: Vec3, dir: Vec3) -> Option<f64> {
     Some((b * e - d) / den)
 }
 
-fn format_len(v: f64) -> String {
+pub(crate) fn format_len(v: f64) -> String {
     let s = format!("{v:.3}");
     let s = s.trim_end_matches('0').trim_end_matches('.');
     format!("{} mm", if s == "-0" { "0" } else { s })
@@ -431,7 +450,7 @@ fn draw(app: &SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj: &Proj,
             | Kind::OffsetFaces { .. }
             | Kind::SketchModify(crate::sketch_modify_ui::Mod::Move { .. })
     );
-    let focus = std::mem::take(&mut d.focus);
+    let mut focus = std::mem::take(&mut d.focus);
     let half_height = app.cam.half_height();
     let axis = revolve_axis(app, d);
     if matches!(d.kind, Kind::Revolve { .. }) {
@@ -517,6 +536,11 @@ fn draw(app: &SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj: &Proj,
             opts.all = false;
         }
         dir = None;
+        // A Single hole's distances from its reference edges (#37); a newly picked edge's box
+        // takes the keyboard.
+        if crate::hole_refs::canvas(app, ui, painter, proj, d) {
+            focus = false;
+        }
     }
     // A fillet with a radius spline is shaped by its handles along the edge; the arrow would sit
     // on one of them.
@@ -566,13 +590,35 @@ fn draw(app: &SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj: &Proj,
 /// text (e.g. "4 mm" -> "15 mm") would leave the stale, shorter selection from the pick in place,
 /// covering only part of the new text.
 fn value_box(ui: &mut egui::Ui, label: &str, value: &mut String, at: Pos2, select_all: bool) {
+    value_box_with(ui, label, value, at, select_all, false);
+}
+
+/// [`value_box`]; with `keep_tab` Tab stays in the box for the caller (the Move box steps
+/// through its values with it).
+fn value_box_with(ui: &mut egui::Ui, label: &str, value: &mut String, at: Pos2, select_all: bool, keep_tab: bool) {
+    let ids = (egui::Id::new("sc_canvas_area"), egui::Id::new("sc_canvas_value"));
+    value_box_in(ui, ids, label, value, (at, egui::Align2::LEFT_TOP), select_all, keep_tab);
+}
+
+/// [`value_box_with`] under its own ids (its area's and its field's), for a value beside the main
+/// one (a hole's reference distances), with the point of the box that sits at `at`. Returns where
+/// the field is.
+pub(crate) fn value_box_in(
+    ui: &mut egui::Ui,
+    (area, id): (egui::Id, egui::Id),
+    label: &str,
+    value: &mut String,
+    (at, pivot): (Pos2, egui::Align2),
+    select_all: bool,
+    keep_tab: bool,
+) -> Option<egui::Rect> {
     let t = Tokens::get();
-    let id = egui::Id::new("sc_canvas_value");
-    crate::frame::area(egui::Id::new("sc_canvas_area")).fixed_pos(at).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
-        egui::Frame::popup(ui.style()).inner_margin(egui::Margin::symmetric(6, 3)).show(ui, |ui| {
+    let mut field = None;
+    Container::new(ui.ctx(), Surface::Canvas).area(area).fixed_pos(at).pivot(pivot).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
+        Container::popup_frame(ui.style()).inner_margin(egui::Margin::symmetric(6, 3)).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(crate::i18n::tr_label(label)).color(t.text_dim).size(crate::theme::Tokens::get().font_caption));
-                let r = ui.add(egui::TextEdit::singleline(value).id(id).desired_width(72.0));
+                let r = crate::ui_kit::canvas_value_field(ui, id, value, keep_tab);
                 crate::params_dialog::complete(ui, &r, value);
                 if select_all {
                     r.request_focus();
@@ -581,9 +627,11 @@ fn value_box(ui: &mut egui::Ui, label: &str, value: &mut String, at: Pos2, selec
                     st.cursor.set_char_range(Some(egui::text_selection::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(n))));
                     st.store(ui.ctx(), id);
                 }
+                field = Some(r.rect);
             });
         });
     });
+    field
 }
 
 /// How far (logical points) from an arrow's stem a press still takes the arrow.
@@ -895,7 +943,7 @@ fn measure_line(app: &SolveApp, painter: &egui::Painter, proj: &Proj, r: &serde_
     if app.preferences.measure_axis_distances {
         measure_components(app, painter, proj, a, b, rect);
     }
-    painter.rect(rect, 3.0, t.overlay, Stroke::new(1.0, t.border), egui::StrokeKind::Inside);
+    painter.rect(rect, t.radius_sm.saturating_sub(1), t.overlay, t.control_border_stroke(t.border), egui::StrokeKind::Inside);
     painter.galley(rect.min + vec2(5.0, 3.0), galley, t.text);
 }
 
@@ -955,7 +1003,7 @@ fn measure_components(app: &SolveApp, painter: &egui::Painter, proj: &Proj, a: V
             }
         }
         painter.line_segment([at, rect.center()], Stroke::new(0.8, color));
-        painter.rect(rect, 3.0, t.overlay, Stroke::new(1.0, color), egui::StrokeKind::Inside);
+        painter.rect(rect, t.radius_sm.saturating_sub(1), t.overlay, Stroke::new(1.0, color), egui::StrokeKind::Inside);
         painter.galley(rect.min + vec2(5.0, 3.0), galley, t.text);
         let handle = format!("measure:label:{axis}");
         crate::scenario::publish_target(&handle, rect);
@@ -1178,9 +1226,13 @@ fn draw_revolve(
     if to_mode {
         // This badge is read-only. Its placement follows the model and can overlap the
         // command dialog, whose buttons must keep receiving clicks.
-        let area = crate::frame::area(egui::Id::new("sc_canvas_area")).fixed_pos(box_at).order(egui::Order::Foreground).interactable(false);
+        let area = Container::new(ui.ctx(), Surface::Canvas)
+            .area(egui::Id::new("sc_canvas_area"))
+            .fixed_pos(box_at)
+            .order(egui::Order::Foreground)
+            .interactable(false);
         area.show(ui.ctx(), |ui| {
-            egui::Frame::popup(ui.style()).inner_margin(egui::Margin::symmetric(6, 3)).show(ui, |ui| {
+            Container::popup_frame(ui.style()).inner_margin(egui::Margin::symmetric(6, 3)).show(ui, |ui| {
                 let text = if extent.curved_to {
                     "To surface".into()
                 } else if extent.sweep.is_finite() {

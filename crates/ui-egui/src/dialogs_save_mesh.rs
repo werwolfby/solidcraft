@@ -1,7 +1,7 @@
 //! The Save as mesh dialog (`file.save_mesh`): which bodies, the mesh format, and optionally a
 //! slicer to open the saved file in.
 //!
-//! Every place that saves a mesh opens this dialog: File › Save as mesh, the Mesh tab, and the
+//! Every place that saves a mesh opens this dialog: File › Export STL / Export 3MF, the Mesh tab, and the
 //! Save As Mesh item of the body menus. The slicer list holds the programs the user added (kept
 //! between runs, newest first), then the slicers found on this machine, then "Custom…", which asks
 //! for a program and adds it at the top; "Custom…" itself is never the selection. Pressing Delete
@@ -37,6 +37,14 @@ pub struct SaveMesh {
     slicer: String,
     /// The slicer list has not been read for this opening yet.
     stale: bool,
+}
+
+impl SaveMesh {
+    /// The chosen format, as `file.save_mesh` names it (`stl`, `3mf`, `3mf-tagged`).
+    #[cfg(test)]
+    pub(crate) fn format_name(&self) -> &'static str {
+        FORMATS.get(self.format).map_or("stl", |f| f.1)
+    }
 }
 
 /// One line of the slicer list.
@@ -87,6 +95,17 @@ pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
     Some((kind, vec![SelInput::new("Bodies", BODIES, true)]))
 }
 
+/// Open the dialog with `format` (`stl`, `3mf` or `3mf-tagged`) chosen, whatever was used last:
+/// File › Export STL… and Export 3MF…. The user can still change it in the dialog.
+pub fn start_with_format(app: &mut SolveApp, format: &str) {
+    app.start("file.save_mesh");
+    if let Some(index) = FORMATS.iter().position(|f| f.1 == format)
+        && let Some(Kind::SaveMesh(k)) = app.dialog.as_mut().map(|d| &mut d.kind)
+    {
+        k.format = index;
+    }
+}
+
 /// A popup with the slicer list is open (Delete belongs to it, not to the design's selection).
 pub fn popup_open(ctx: &egui::Context) -> bool {
     let frame = ctx.cumulative_frame_nr();
@@ -125,7 +144,7 @@ fn paint_icon(ui: &egui::Ui, rect: egui::Rect, tex: Option<egui::TextureId>, nam
         }
         None => {
             let t = Tokens::get();
-            ui.painter().rect_filled(rect, 3.0, t.chip);
+            ui.painter().rect_filled(rect, t.radius_sm.saturating_sub(1), t.chip);
             let letter = name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
             ui.painter().text(
                 rect.center(),
@@ -193,7 +212,7 @@ fn slicer_combo(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut SaveMesh) {
             let selected = e.key == k.slicer;
             if resp.hovered() || selected {
                 let fill = if resp.hovered() { Tokens::get().hover } else { Tokens::get().selected_bg };
-                ui.painter().rect_filled(rect, 2.0, fill);
+                ui.painter().rect_filled(rect, Tokens::get().radius_sm / 2, fill);
             }
             paint_icon(ui, egui::Rect::from_min_size(rect.left_center() + vec2(3.0, -ICON / 2.0), vec2(ICON, ICON)), tex, &e.slicer.name);
             ui.painter().text(
@@ -221,7 +240,7 @@ fn slicer_combo(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut SaveMesh) {
         }
         let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::click());
         if resp.hovered() {
-            ui.painter().rect_filled(rect, 2.0, Tokens::get().hover);
+            ui.painter().rect_filled(rect, Tokens::get().radius_sm / 2, Tokens::get().hover);
         }
         ui.painter().text(
             rect.left_center() + vec2(ICON + 9.0, 0.0),

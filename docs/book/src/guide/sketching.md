@@ -3,7 +3,9 @@
 A sketch lies on a plane: an origin plane, a construction plane or a planar face. Start one with
 **Create Sketch** (`sketch.create`) and click a plane, or pick a face first. Right-clicking a
 plane, in the view or on its browser row, offers **Create Sketch** on that plane too.
-**Finish Sketch** returns to the model.
+**Finish Sketch** returns to the model. **Cancel Sketch** (`sketch.cancel`) returns without
+keeping what changed since the sketch was created or opened for editing: a new sketch is removed,
+an edited one goes back to how it was, as one step that Undo brings back.
 
 In scripts, `XY`, `XZ`, `YZ` and their `Top`, `Front`, `Right` aliases name origin planes.
 These names are reserved: a construction plane cannot be created with or renamed to one
@@ -202,7 +204,8 @@ Press D, click what you want to measure and type the value: as soon as the click
 dimension (one line, circle or arc, or the second point or line of a distance or angle), its
 value box takes the keyboard with the measured value selected, so typing replaces it. Numbers,
 units (`1 in`), expressions (`2*width`) and parameter names all work; letters go into the box,
-not to tool shortcuts. While you type, the dimension text follows the cursor, and Enter places
+not to tool shortcuts. `width = 40` defines the user parameter `width` and dimensions with it,
+in one step. While you type, the dimension text follows the cursor, and Enter places
 it there (or in its default place if you haven't moved the cursor) as one undo step. Esc
 cancels the dimension.
 
@@ -240,7 +243,9 @@ You can also start the constraint first and then pick its curves. An incomplete 
 selection leaves the tool ready for ordinary picking.
 
 Coincident accepts an exact selection of two points or a point and a curve. Midpoint
-accepts one point and one line, in either selection order. Symmetry accepts two distinct
+accepts one point and one line, in either selection order, or two lines: the second line
+moves (keeping its length) until its midpoint sits on the first line's midpoint,
+and stays centred there as either line changes. Symmetry accepts two distinct
 points and one symmetry line, regardless of where the line occurs in the selection.
 Successful constraints clear the selection; rejected constraints preserve it.
 
